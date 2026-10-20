@@ -4,6 +4,7 @@ import ImageFile from "../image.js";
 import Palette from "../ui/palette.js";
 import {runWebGLQuantizer} from "../util/webgl-quantizer.js";
 import UserSettings from "../userSettings.js";
+import {compositeNodes} from "../util/layerUtils.js";
 
 let Recorder = (()=>{
     let me = {};
@@ -179,17 +180,10 @@ let Recorder = (()=>{
                     canvas.height = currentFile.height;
                     let ctx = canvas.getContext("2d");
 
-                    frame.layers.forEach((layer) => {
-                        if (layer.visible && layer.name.indexOf("_") !== 0) {
-                            ctx.globalAlpha = layer.opacity / 100;
-                            let blendMode = layer.blendMode || "normal";
-                            if (blendMode === "normal") blendMode = "source-over";
-                            ctx.globalCompositeOperation = blendMode;
-                            ctx.drawImage(layer.render(), 0, 0);
-                            ctx.globalAlpha = 1;
-                            ctx.globalCompositeOperation = "source-over";
-                        }
-                    });
+                    // Composite through the shared helper so per-layer offsets and the
+                    // resolved timeline overlay apply exactly as they do in getCanvas().
+                    let visible = frame.layers.filter(layer=>layer.visible && layer.name.indexOf("_") !== 0);
+                    compositeNodes(visible, ctx, ImageFile.getResolvedProps());
                     return canvas;
                 }
             }
@@ -337,11 +331,9 @@ let Recorder = (()=>{
         console.log("Frame captured");
     };
 
-    // Event handlers
-    EventBus.on(COMMAND.RECORDINGSTART, me.startRecording);
-    EventBus.on(COMMAND.RECORDINGSTOP, me.stopAndDownload);
-    EventBus.on(COMMAND.RECORDINGEXPORT, me.stopAndDownload);
-    
+    // COMMAND.RECORDINGSTART/STOP/EXPORT are wired in app.js, which lazily loads this module on
+    // first use instead of registering these handlers eagerly here.
+
     // Capture frames on history changes (undo points)
     EventBus.on(EVENT.historyChanged, () => {
         if (isRecording) {

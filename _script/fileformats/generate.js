@@ -7,6 +7,11 @@ import Palette from "../ui/palette.js";
 import IndexedPng from "./png.js";
 import GIF from "./gif.js";
 import PSD from "./psd.js";
+import PCX from "./pcx.js";
+import Video from "./video.js";
+import SVG from "./svg.js";
+import PDF from "./pdf.js";
+import BinaryStream from "../util/binarystream.js";
 
 function rleCompress(bytes) {
     var packed = [];
@@ -59,7 +64,7 @@ let Generate = function(){
         };
         if (config.maxColors){
             let colors = ImageProcessing.getColors(ImageFile.getCanvas(),config.maxColors).length;
-            if (ImageFile.getCurrentFile().frames.length>1 && config.checkAllFrames){
+            if (ImageFile.hasMultipleFrames() && config.checkAllFrames){
                 colors = Math.max(colors,ImageProcessing.getColors(ImageFile.getCanvas(1),config.maxColors).length);
             }
             if (colors > config.maxColors){
@@ -98,7 +103,7 @@ let Generate = function(){
             case "PLANEIMAGES":
                 return await me.planeImages();
             case "SPRITE":
-                return me.sprite();
+                return me.sprite(options);
             case "ANIM":
                 return me.anim(options);
             case "PNG":
@@ -118,9 +123,17 @@ let Generate = function(){
                     file: await new Promise(resolve => ImageFile.getCanvas().toBlob(resolve,"image/jpeg",q))
                 };
             case "PNG8":
-                return me.png8();
+                return me.png8(options);
             case "GIF":
-                return me.gif();
+                return me.gif(options);
+            case "VIDEO":
+                return await me.video(options);
+            case "PCX":
+                return me.pcx(options);
+            case "SVG":
+                return me.svg(options);
+            case "PDF":
+                return me.pdf(options);
             case "DPAINT":
                 return me.dPaint();
             case "DPAINTINDEXED":
@@ -173,7 +186,9 @@ let Generate = function(){
             }
         }
         
-        let frames = ImageFile.getCurrentFile().frames;
+        // Every animation exporter consumes BAKED frames: fully resolved composites of the
+        // whole timeline, so tweens and multiple tracks come out correctly (design 3.10).
+        let frames = ImageFile.getBakedFrames();
         // console.log("Generating ANIM from " + frames.length + " frames");
 
         let buffer = IFF.writeAnim(frames, options); 
@@ -198,7 +213,9 @@ let Generate = function(){
             return;
         }
 
-       return IFF.toBitPlanes(ImageFile.getCanvas(),true);
+       // Raw bitplanes have no embedded palette, so their indices must follow
+       // the current palette regardless of the palette-lock setting.
+       return IFF.toBitPlanes(ImageFile.getCanvas(),true,false,Palette.get());
 
     }
 
@@ -222,9 +239,12 @@ let Generate = function(){
         let isEHB = originalColors.length > 32 && originalColors.length <= 64;
 
         let files = [];
-        let iffOptions = { maxColors: 64 };
+        // The plane images below are raw bitplanes indexed against the current palette,
+        // so the .iff shipped alongside them has to use that same palette - an optimized
+        // CMAP would not match the planes. This export has no palette option of its own.
+        let iffOptions = { maxColors: 64, palette: "locked" };
         if (isEHB) iffOptions.ehb = true;
-        
+
         let iffBuffer = IFF.write(canvas, iffOptions);
         files.push({
              name: ".iff",
@@ -278,68 +298,183 @@ let Generate = function(){
         };
     }
 
-    me.sprite=()=>{
-        let maxColors = 4;
-        // TODO: support for 16 color sprites
-        let check = me.validate({
-            maxColors: maxColors,
-            maxWidth: 16,
-            maxHeight: 320
-        })
+    // TODO: support for 16 color attached sprites
+    const SPRITE_WIDTH = 16;
+    const SPRITE_MAX_HEIGHT = 320;
+    const SPRITE_COLORS = 4;
+    const SPRITE_BANK_MAGIC = 0x5350; // "SP"
 
-        if (!check.valid){
+    me.sprite=(options)=>{
+        options = options || {};
+        return options.spriteFormat === "binary" ? me.spriteBank() : me.spriteCode();
+    }
+
+    me.spriteCode=()=>{
+        let title = "Save as Sprite data";
+        let check = validateSprite([ImageFile.getCanvas()]);
+
+        if (check.errors.length){
             return {
                 result: "error",
-                title: "Save as Sprite data",
+                title: title,
                 messages: ["Sorry, this image can't be saved as Sprite data."].concat(check.errors),
                 buttons: [{label:"OK"}]
             }
         }
 
-        let iff = IFF.toBitPlanes(ImageFile.getCanvas(),true);
+        let sprite = toSpriteWords(ImageFile.getCanvas(),check.palette);
 
         let output = [];
-        if (iff && iff.planes){
-            let planeCount = iff.planes.byteLength / iff.bitPlaneSize;
-            console.error(planeCount);
-            output.push("static UWORD __chip sprite[] = {");
-            output.push("  0x0000, 0x0000, ");
-            var byteView = new Uint8Array(iff.planes);
-            for (let i = 0; i < iff.height; i++){
-                let b1 = byteView[i * 2];
-                let b2 = byteView[i * 2 + 1];
-                let w = (b1 << 8) | b2;
-                let hex = "0x" + w.toString(16).padStart(4,"0") + ", ";
-                if (planeCount > 1){
-                    b1 = byteView[i * 2 + iff.height * 2];
-                    b2 = byteView[i * 2 + 1 + iff.height * 2];
-                    w = (b1 << 8) | b2;
-                    hex += "0x" + w.toString(16).padStart(4,"0") + ", ";
-                }
-                output.push("  " + hex);
-            }
-
-            output.push("  0x0000, 0x0000");
-            output.push("};");
-
-            //renderTextOutput(output.join("\n"));
+        output.push("static UWORD __chip sprite[] = {");
+        output.push("  0x0000, 0x0000,"); // vstart/vstop control words
+        for (let i = 0; i < sprite.height; i++){
+            output.push("  " + hexWord(sprite.words[i*2]) + ", " + hexWord(sprite.words[i*2 + 1]) + ",");
         }
-
-        debugger;
+        output.push("  0x0000, 0x0000"); // hardware termination
+        output.push("};");
 
         return {
             result: "ok",
-            text: output.join("\n"),
-            //file: new Blob([buffer], {type: "application/octet-stream"})
+            text: output.join("\n")
         };
+    }
 
+    // Sprite Bank: every frame becomes one sprite, in a single big-endian binary file
+    // that can be loaded straight into CHIP RAM without any parsing.
+    me.spriteBank=()=>{
+        let title = "Save as Amiga Sprite";
+        let canvases = ImageFile.getBakedFrames();
+
+        if (!canvases.length){
+            return {
+                result: "error",
+                title: title,
+                messages: ["There are no frames to export."],
+                buttons: [{label:"OK"}]
+            }
+        }
+
+        let check = validateSprite(canvases);
+
+        if (check.errors.length){
+            return {
+                result: "error",
+                title: title,
+                messages: ["Sorry, this image can't be saved as a sprite bank."].concat(check.errors),
+                buttons: [{label:"OK"}]
+            }
+        }
+
+        let sprites = canvases.map(canvas=>toSpriteWords(canvas,check.palette));
+        let spriteSize = sprite => 4 + sprite.words.length * 2 + 4; // control + data + termination
+        let headerSize = 4 + sprites.length * 4; // magic + count + offset table
+        let fileSize = sprites.reduce((total,sprite)=>total + spriteSize(sprite),headerSize);
+
+        // big-endian: the file is read as-is by a 68000
+        let file = BinaryStream(new ArrayBuffer(fileSize),true);
+        file.writeWord(SPRITE_BANK_MAGIC);
+        file.writeWord(sprites.length);
+
+        let offset = headerSize;
+        sprites.forEach(sprite=>{
+            file.writeUint(offset);
+            offset += spriteSize(sprite);
+        });
+
+        sprites.forEach(sprite=>{
+            // control words, overwritten by sprite_setPosition() on the Amiga side
+            file.writeWord(0);
+            file.writeWord(0);
+            sprite.words.forEach(word=>file.writeWord(word));
+            // hardware termination
+            file.writeWord(0);
+            file.writeWord(0);
+        });
+
+        return {
+            result: "ok",
+            file: new Blob([file.buffer], {type: "application/octet-stream"})
+        };
+    }
+
+    // Interleaved bitplane words for one sprite: [plane0,plane1] for each line.
+    // The palette is padded to 4 entries by validateSprite(), so toBitPlanes() always
+    // returns the 2 planes the hardware expects, even for a 2 color image.
+    function toSpriteWords(canvas,palette){
+        let bitplanes = IFF.toBitPlanes(canvas,true,false,palette);
+        let byteView = new Uint8Array(bitplanes.planes);
+        let words = [];
+        for (let y = 0; y < bitplanes.height; y++){
+            // 16 pixels wide, so exactly one word per bitplane per line
+            let plane0 = y * 2;
+            let plane1 = bitplanes.bitPlaneSize + plane0;
+            words.push((byteView[plane0] << 8) | byteView[plane0 + 1]);
+            words.push((byteView[plane1] << 8) | byteView[plane1 + 1]);
+        }
+        return {
+            height: bitplanes.height,
+            words: words
+        };
+    }
+
+    // Sprites carry no palette of their own: their indices only make sense against the
+    // first 4 colors of the current palette, so colors outside those are an error
+    // instead of silently ending up as index 0.
+    function validateSprite(canvases){
+        let errors = [];
+        let currentFile = ImageFile.getCurrentFile();
+
+        let palette = IFF.getBitPlanePalette(canvases[0],true).slice(0,SPRITE_COLORS);
+        while (palette.length < SPRITE_COLORS) palette.push([0,0,0]);
+
+        if (currentFile.width > SPRITE_WIDTH){
+            errors.push("Sprites are " + SPRITE_WIDTH + " pixels wide. Please reduce the image width to " + SPRITE_WIDTH + " pixels or less.");
+        }
+        if (currentFile.height > SPRITE_MAX_HEIGHT){
+            errors.push("Please reduce the image height to maximum " + SPRITE_MAX_HEIGHT + " pixels.");
+        }
+
+        let used = new Set();
+        canvases.forEach(canvas=>getUsedColors(canvas).forEach(color=>used.add(color)));
+
+        if (used.size > SPRITE_COLORS){
+            errors.push("Please reduce the number of colors to maximum " + SPRITE_COLORS + ".");
+        }else{
+            let available = new Set(palette.map(color=>(color[0] << 16) | (color[1] << 8) | color[2]));
+            let missing = [...used].filter(color=>!available.has(color));
+            if (missing.length){
+                let list = missing.map(color=>rgbToHex((color >> 16) & 255,(color >> 8) & 255,color & 255)).join(", ");
+                errors.push("Sprites use the first " + SPRITE_COLORS + " colors of the palette, but " + list + (missing.length>1 ? " are" : " is") + " not among them.");
+            }
+        }
+
+        return {errors: errors, palette: palette};
+    }
+
+    // Opaque colors used in a canvas, as packed rgb values.
+    // Same alpha cutoff as toBitPlanes(), so transparent pixels don't count as a color.
+    function getUsedColors(canvas){
+        let w = canvas.width;
+        let h = canvas.height;
+        let data = canvas.getContext("2d").getImageData(0,0,w,h).data;
+        let colors = new Set();
+        for (let i = 0; i < data.length; i += 4){
+            if (data[i + 3] < 128) continue;
+            colors.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
+        }
+        return colors;
+    }
+
+    function hexWord(value){
+        return "0x" + value.toString(16).padStart(4,"0");
     }
 
     me.mask=()=>{
         return IFF.toBitMask(ImageFile.getCanvas());
     }
 
-    me.png8=()=>{
+    me.png8=(options)=>{
+        options = options || {};
         let maxColors = 256;
 
         let check = me.validate({
@@ -353,14 +488,24 @@ let Generate = function(){
             }
         }
 
-        let buffer = IndexedPng.write(ImageFile.getCanvas());
+        let canvas = ImageFile.getCanvas();
+
+        // Honour the "Optimize"/"Current" palette option (mirrors the IFF writer).
+        // When not locked, rebuild the palette from the colors actually used in the
+        // image instead of relying on the current global palette - otherwise opening
+        // a true-color image and saving as PNG8 would write with the default palette.
+        let lockPalette = (options.palette === "locked") || (Palette.getColorRanges() || []).length || Palette.isLocked() || Palette.isLockedGlobal();
+        let palette = lockPalette ? Palette.get() : ImageProcessing.getColors(canvas, maxColors);
+
+        let buffer = IndexedPng.write(canvas, palette);
         return {
             result: "ok",
             file: new Blob([buffer], {type: "application/octet-stream"})
         };
     }
 
-    me.gif=()=>{
+    me.gif=(options)=>{
+        options = options || {};
         let maxColors = 256;
         let check = me.validate({
             maxColors: maxColors
@@ -373,11 +518,116 @@ let Generate = function(){
             }
         }
 
-        let buffer = GIF.write(ImageFile.getCurrentFile().frames);
+        // "frame" writes a still GIF of the frame under the playhead; "animation" (the
+        // default) writes every timeline frame.
+        let buffer;
+        if (options.gifMode === "frame"){
+            let frameIndex = ImageFile.getActiveFrameIndex();
+            buffer = GIF.write([ImageFile.getCanvas(frameIndex)],{frameIndices:[frameIndex]});
+        }else{
+            buffer = GIF.write(ImageFile.getBakedFrames());
+        }
         return {
             result: "ok",
             file: new Blob([buffer], {type: "application/octet-stream"})
         };
+    }
+
+    me.video = async (options) => {
+        options = options || {};
+        let title = "Save as Video";
+        if (!ImageFile.getFrameCount()) {
+            return {
+                result: "error",
+                title: title,
+                messages: ["There are no frames to export."],
+                buttons: [{label: "OK"}]
+            };
+        }
+
+        try {
+            let blob;
+            // Bounded, revision-isolated path (spec 016 phase 10): freeze the revision and stream
+            // one composited frame at a time. Only usable when WebCodecs is available (no
+            // re-iterable fallback); otherwise fall back to the eager baked-frame array.
+            if (Video.canStream && Video.canStream()){
+                let snapshot = ImageFile.createExportFrameSnapshot();
+                let frames = ImageFile.iterateExportFrames(snapshot);
+                blob = await Video.write(frames, options);
+            }else{
+                let canvases = ImageFile.getBakedFrames();
+                if (!canvases || !canvases.length){
+                    return {
+                        result: "error",
+                        title: title,
+                        messages: ["There are no frames to export."],
+                        buttons: [{label: "OK"}]
+                    };
+                }
+                blob = await Video.write(canvases, options);
+            }
+            return {
+                result: "ok",
+                file: blob
+            };
+        } catch (err) {
+            console.error("Video export failed:", err);
+            return {
+                result: "error",
+                title: title,
+                messages: ["Video export failed: " + (err && err.message ? err.message : err)],
+                buttons: [{label: "OK"}]
+            };
+        }
+    }
+
+    // Hybrid SVG of the active frame (spec 009): vector layers as true <path> geometry, pixel
+    // layers as embedded base64 PNG. The frame walk / rasterize decisions live in
+    // ImageFile.getSvgExportModel; SVG.write only serializes.
+    me.svg=()=>{
+        let file = ImageFile.getCurrentFile();
+        let model = ImageFile.getSvgExportModel(ImageFile.getActiveFrameIndex());
+        let svg = SVG.write(model, file.width, file.height);
+        return {
+            result: "ok",
+            file: new Blob([svg], {type: "image/svg+xml"})
+        };
+    }
+
+    // Single-page PDF of the current frame (spec 020): one FlateDecode-compressed image
+    // XObject, current frame only, no vector content. See docs/pdf_support.md.
+    me.pdf=(options)=>{
+        let currentFile = ImageFile.getCurrentFile();
+        let frame = ImageFile.getActiveFrame();
+        let canvas = ImageFile.getCanvas();
+        let buffer = PDF.write(frame, currentFile.width, currentFile.height, canvas, options);
+        return {
+            result: "ok",
+            file: new Blob([buffer], {type: "application/pdf"})
+        };
+    }
+
+    me.pcx=()=>{
+        let canvas = ImageFile.getCanvas();
+        let { bitsPerPixel, colorPlanes, palette } = me.pcxFormat(canvas);
+        let buffer = PCX.write(canvas, { bitsPerPixel, colorPlanes, palette });
+        return {
+            result: "ok",
+            file: new Blob([buffer], {type: "application/octet-stream"})
+        };
+    }
+
+    // Returns the best PCX format descriptor for a given canvas.
+    // Exported so the save dialog can display format info without writing.
+    me.pcxFormat = (canvas) => {
+        let colors = ImageProcessing.getColors(canvas, 256);
+        let n = colors.length;
+        if (n > 256) return { bitsPerPixel: 8, colorPlanes: 3, palette: null,   label: "24-bit RGB" };
+        if (n > 16)  return { bitsPerPixel: 8, colorPlanes: 1, palette: colors, label: "8-bit indexed, " + n + " colors" };
+        if (n > 8)   return { bitsPerPixel: 1, colorPlanes: 4, palette: colors, label: "4-bit planar, " + n + " colors" };
+        if (n > 4)   return { bitsPerPixel: 1, colorPlanes: 3, palette: colors, label: "3-bit planar, " + n + " colors" };
+        if (n > 2)   return { bitsPerPixel: 1, colorPlanes: 2, palette: colors, label: "2-bit planar, " + n + " colors" };
+        return         { bitsPerPixel: 1, colorPlanes: 1, palette: colors, label: "1-bit monochrome" };
     }
 
     me.psd=(options)=>{
@@ -399,7 +649,7 @@ let Generate = function(){
         if (indexed && exportResult.errorCount){
             let pixels = " pixel";
             if (exportResult.errorCount>1) pixels += "s";
-            result.messages = [exportResult.errorCount + pixels + " could not be converted to index colors because there was no matching color found in the palette."];
+            result.messages = [exportResult.errorCount + pixels + " had no exact match in the palette and were written as the nearest palette color."];
             result.result = "warning";
         }
         result.file = new Blob([JSON.stringify(exportResult)], { type: 'application/json' });
@@ -882,39 +1132,6 @@ let Generate = function(){
             image.onerror = reject;
             image.src = dataUrl;
         });
-    }
-
-    async function writeSPRITE(){
-        let result = await Generate.file("SPRITE");
-        console.error(result);
-        if (result && result.planes){
-            let output = [];
-            let planeCount = result.planes.byteLength / result.bitPlaneSize;
-            output.push("static UWORD __chip sprite[] = {");
-            output.push("  0x0000, 0x0000, ");
-            var byteView = new Uint8Array(result.planes);
-            for (let i = 0; i < result.height; i++){
-                let b1 = byteView[i * 2];
-                let b2 = byteView[i * 2 + 1];
-                let w = (b1 << 8) | b2;
-                let hex = "0x" + w.toString(16).padStart(4,"0") + ", ";
-                if (planeCount > 1){
-                    b1 = byteView[i * 2 + result.height * 2];
-                    b2 = byteView[i * 2 + 1 + result.height * 2];
-                    w = (b1 << 8) | b2;
-                    hex += "0x" + w.toString(16).padStart(4,"0") + ", ";
-                }
-                output.push("  " + hex);
-            }
-
-            console.error(planeCount);
-
-            output.push("  0x0000, 0x0000");
-            output.push("};");
-
-            //renderTextOutput(output.join("\n"));
-        }
-        return result;
     }
 
     return me

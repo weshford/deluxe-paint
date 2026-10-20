@@ -5,14 +5,24 @@ import ImageFile from "./image.js";
 import Palette from "./ui/palette.js";
 import Modal, {DIALOG} from "./ui/modal.js";
 import Brush from "./ui/brush.js";
+import ClientApi from "./services/api.js";
+import PanelManager from "./ui/panelManager.js";
+import TimelinePanel from "./ui/toolPanels/timelinePanel.js";
+import {duplicateCanvas, releaseCanvas} from "./util/canvasUtils.js";
+import HistoryService from "./services/historyservice.js";
+import visualScheduler from "./services/visualScheduler.js";
+import {createInputBarrier, barrierAction} from "./util/inputSampleBuffer.js";
+import Editor from "./ui/editor.js";
+import {ensureRecorder} from "./services/recorderLoader.js";
 
 let App = function(){
 	let me = {
-		version: "0.2.0.4 alpha"
+		version: "0.2.0.6 alpha"
 	}
 	
 	me.init = function(){
 		UI.init();
+		ClientApi.init();
 		EventBus.trigger(COMMAND.NEW);
 
 		let urlParams = new URLSearchParams(window.location.search);
@@ -40,9 +50,12 @@ let App = function(){
 				}).catch((err)=>{});
 			}
 		}else{
-			// show about dialog on first run
+			// show about dialog on first run — skip (and retry next load) if the user has
+			// already opened some other dialog (e.g. Save) in the meantime, so this delayed
+			// popup can't clobber it
 			if (window.localStorage.getItem("dp_about")!=="true"){
 				setTimeout(()=>{
+					if (Modal.isVisible()) return;
 					EventBus.trigger(COMMAND.ABOUT);
 					window.localStorage.setItem("dp_about","true");
 				},200);
@@ -99,16 +112,37 @@ let App = function(){
 			});
 		});
 
-		EventBus.on(COMMAND.TOGGLEGALLERY,(andOpen)=>{
-			import("./ui/components/gallery.js").then(Gallery=>{
-				Gallery.default.toggle(andOpen);
-			});
+		EventBus.on(COMMAND.RECORDINGSTART,()=>{
+			ensureRecorder().then(r=>r.startRecording());
+		});
+		EventBus.on(COMMAND.RECORDINGSTOP,()=>{
+			ensureRecorder().then(r=>r.stopAndDownload());
+		});
+		EventBus.on(COMMAND.RECORDINGEXPORT,()=>{
+			ensureRecorder().then(r=>r.stopAndDownload());
 		});
 
-		EventBus.on(COMMAND.VIEWPLANES,(andOpen)=>{
-			import("./ui/components/bitplanes.js").then(BitPlanes=>{
-				BitPlanes.default.toggle(andOpen);
-			});
+		EventBus.on(COMMAND.TOGGLEGALLERY,(andOpen)=>{
+			// Gallery is now a dock-capable free panel.
+			if (PanelManager.isVisible("gallery")){
+				PanelManager.hide("gallery");
+			}else{
+				PanelManager.reveal("gallery", true);
+				if (andOpen){
+					import("./ui/components/gallery.js").then(Gallery=>{
+						Gallery.default.openFirst();
+					});
+				}
+			}
+		});
+
+		EventBus.on(COMMAND.VIEWPLANES,()=>{
+			// Bitplane viewer is now a dock-capable free panel.
+			if (PanelManager.isVisible("bitplanes")){
+				PanelManager.hide("bitplanes");
+			}else{
+				PanelManager.reveal("bitplanes", true);
+			}
 		});
 
 		EventBus.on(COMMAND.ABOUT,()=>{
@@ -269,6 +303,31 @@ let App = function(){
 	}
 	*/
 
+	window.createFrames = async function(count){
+		count = count || 1;
+		HistoryService.setEnabled(false);
+		try{
+			for (let i = 0; i < count; i++){
+				console.log("createFrames: adding frame " + (i + 1) + " of " + count);
+				ImageFile.activateFrame(ImageFile.getFrameCount() - 1);
+				await ImageFile.duplicateFrame();
+				// layers are ordered bottom to top: shift the bottom layer 1px down, each layer above 1px more
+				ImageFile.getActiveFrame().layers.forEach((layer, index) => {
+					let canvas = layer.getCanvas();
+					let ctx = layer.getContext();
+					let copy = duplicateCanvas(canvas, true);
+					ctx.clearRect(0, 0, canvas.width, canvas.height);
+					ctx.drawImage(copy, 0, index + 1);
+					releaseCanvas(copy);
+				});
+			}
+		}finally{
+			HistoryService.setEnabled(true);
+		}
+		console.log("createFrames: done, added " + count + " frames");
+		EventBus.trigger(EVENT.layerContentChanged);
+	}
+
 	// Expose modules for testing
 		if (typeof window !== 'undefined' && navigator.webdriver) {
 			window.Brush = Brush;
@@ -276,6 +335,21 @@ let App = function(){
 			window.ImageFile = ImageFile;
 			window.EventBus = EventBus;
 			window.UI = UI;
+			window.COMMAND = COMMAND;
+			window.EVENT = EVENT;
+			window.PanelManager = PanelManager;
+			window.TimelinePanel = TimelinePanel;
+			// generate.js (and every export-format writer under it) is otherwise only reached via
+			// dynamic import, so pull it in the same way here instead of a top-level static import
+			// that would drag the whole export stack into the main bundle just for this test hook.
+			import("./fileformats/generate.js").then(Generate=>{ window.Generate = Generate.default || Generate; });
+			// Spec 016 visual scheduling / commit barriers (default-off wiring)
+			window.VisualScheduler = visualScheduler;
+			window.createInputBarrier = createInputBarrier;
+			window.barrierAction = barrierAction;
+			window.Editor = Editor;
+			window.Modal = Modal;
+			window.DIALOG = DIALOG;
 		}
 
 	return me;

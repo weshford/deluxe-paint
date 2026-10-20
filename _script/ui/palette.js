@@ -4,8 +4,8 @@ import {ANIMATION, COMMAND, EVENT, SETTING} from "../enum.js";
 import Color from "../util/color.js";
 import ImageProcessing from "../util/imageProcessing.js";
 import ImageFile from "../image.js";
-import SidePanel from "./sidepanel.js";
-import {duplicateCanvas} from "../util/canvasUtils.js";
+import PanelManager from "./panelManager.js";
+import {duplicateCanvas, releaseCanvas} from "../util/canvasUtils.js";
 import Animator from "../util/animator.js";
 import ColorRange from "./components/colorRange.js";
 import Modal from "./modal.js";
@@ -28,6 +28,8 @@ let Palette = function(){
     let useAlphaThreshold = true;
     var ditherIndex = 0;
     var ditherAmount = 100;
+    var ditherGrain = 0;    // feature size in px for grain-capable dithers; 0 = the entry default
+    var ditherVariance = 100; // how much of a stamp pool's shape-size range to use (%)
     var quantizationMethod = 0; // 0 = Median Cut, 1 = K-Means
     var targetColorCount = 32;
     let palettePageIndex = 0;
@@ -42,6 +44,13 @@ let Palette = function(){
     let hasDuplicates = false;
     let paletteListIndexElm;
     let colorReducePanel;
+    let reducePaletteSelect;
+    let reduceApplyButton;
+    let reduceCancelButton;
+    let reducePreview = null;       // {layerIndex, canvas, palette} snapshot taken before the first preview
+    let reducePendingCommit = false;// commit requested while a (worker) reduce is still running
+    let reduceCancelPending = false;// cancel requested while a (worker) reduce is still running
+    let reduceProcessing = false;
     let perf = {};
 
     var drawColor = "black";
@@ -207,6 +216,11 @@ let Palette = function(){
         atari2600ntsc:{label: "Atari 2600 NTSC",platform:true,palette:"Atari-2600-NTSC.json"},
         atari:{label: "Atari GTIA",platform:true,palette:"Atari-GTIA.json"},
     };
+    // The Reduce Colors panel only offers the two palettes that describe the image itself.
+    // The preset palettes in paletteMap stay available through the Palettes chooser
+    // (paletteList.js), which is where picking a fixed palette belongs.
+    const REDUCE_PALETTE_OPTIONS = ["current","optimized"];
+
     var targetPalette = null;
 
     me.init = function(parent,paletteParent){
@@ -595,29 +609,67 @@ let Palette = function(){
 
     }
 
+    // The pixels a reduce works from: the ACTIVE LAYER's own canvas — never the document
+    // composite. The result is written back onto that one layer, so sourcing the composite baked
+    // every other visible layer into it (and cost the layer its own transparency).
+    // reducePreview.canvas is that layer's snapshot from before the first preview, so re-running
+    // the reduction on every settings change re-reduces the original pixels instead of
+    // compounding one reduction onto the last.
+    function reduceSource(){
+        if (reducePreview && reducePreview.canvas) return reducePreview.canvas;
+        let layer = ImageFile.getActiveLayer();
+        return layer ? layer.getCanvas() : undefined;
+    }
+
+    // Puts the pre-preview pixels back on the layer (canvas space: the snapshot IS that canvas).
+    function restoreReduceSource(){
+        if (!reducePreview) return;
+        let layer = ImageFile.getLayer(reducePreview.layerIndex);
+        if (!layer) return;
+        layer.clear();
+        layer.getContext().drawImage(reducePreview.canvas,0,0);
+        EventBus.trigger(EVENT.layerContentChanged);
+    }
+
     me.reduce = function(){
         console.log("Reducing palette to " + targetColorCount + " colors");
         EventBus.trigger(EVENT.paletteProcessingStart);
         if (targetColorCount>256 && !targetPalette){
-            ImageFile.restoreOriginal();
+            // "Full": no reduction at all, so put the layer's own original pixels back
+            restoreReduceSource();
             EventBus.trigger(EVENT.paletteProcessingEnd);
         }else{
-            let base = ImageFile.getOriginal();
-             //let base = ImageFile.getActiveLayer().getCanvas();
+            let base = reduceSource();
+            if (!base){
+                EventBus.trigger(EVENT.paletteProcessingEnd);
+                return;
+            }
             let c = duplicateCanvas(base,true);
-                ImageProcessing.reduce(c,targetPalette || targetColorCount,alphaThreshold,ditherIndex,useAlphaThreshold,ditherAmount,quantizationMethod);
-
-
-            SidePanel.show("reduce");
+            ImageProcessing.reduce(c,targetPalette || targetColorCount,alphaThreshold,ditherIndex,useAlphaThreshold,ditherAmount,quantizationMethod,ditherGrain,ditherVariance);
+            PanelManager.reveal("reduce", true);
         }
     }
 
-    me.apply = function(){
-        HistoryService.start(EVENT.imageHistory);
+    // useDither: also apply the dither settings from the "Reduce Colors" panel
+    // skipHistory: caller manages its own history session (HistoryService can't nest)
+    me.apply = function(useDither,skipHistory){
+        if (!skipHistory) HistoryService.start(EVENT.imageHistory);
         let base = ImageFile.getActiveLayer().getCanvas();
         let c = duplicateCanvas(base,true);
-        ImageProcessing.reduce(c,currentPalette,alphaThreshold,0,useAlphaThreshold);
-        HistoryService.end();
+        // the layer's OWN canvas (off-document pixels included), so it maps straight back
+        ImageProcessing.reduce(c,currentPalette,alphaThreshold,useDither ? ditherIndex : 0,useAlphaThreshold,useDither ? ditherAmount : undefined,undefined,useDither ? ditherGrain : undefined,useDither ? ditherVariance : undefined);
+        if (!skipHistory) HistoryService.end();
+    }
+
+    me.getDitherSettings = function(){
+        let options = ImageProcessing.getDithering();
+        let index = parseInt(ditherIndex) || 0;
+        let entry = options[index] || options[0];
+        // grain is only meaningful for entries that declare it; 0 means "use entry.scale"
+        let grain = entry.grain ? (ditherGrain || entry.scale) : 0;
+        // variance only applies to the stamp pools
+        let variance = entry.stamp ? (parseInt(ditherVariance) || 0) : 0;
+        return {index: index, amount: parseInt(ditherAmount) || 0, label: entry.label, grain: grain, variance: variance};
     }
 
     me.getColorIndex = function(color,forceMatch){
@@ -794,7 +846,7 @@ let Palette = function(){
                         applyReduce();
                     }
                 }},
-                Object.keys(paletteMap).map(key=>{
+                REDUCE_PALETTE_OPTIONS.map(key=>{
                     return $("option",{
                         value:key,
                         text:paletteMap[key].label,
@@ -869,19 +921,17 @@ let Palette = function(){
                 onchange:()=>{
                     ditherIndex = select.value;
                 if (ditherAmountPanel) ditherAmountPanel.style.display = ditherIndex == 0 ? "none" : "block";
+                updateDitherPatternButtons();
+                updateDitherGrainPanel();
+                updateDitherVariancePanel();
+                EventBus.trigger(EVENT.ditherSettingsChanged);
                 applyReduce();
             },
             value:ditherIndex
         }));
-        
-        options.forEach((o,index)=>{
-            let option = document.createElement("option");
-            option.value=index;
-            option.innerHTML=o.label;
-            select.appendChild(option);
-        });
-        
-       
+
+        fillDitherOptions();
+
 
 
         let ditherAmountPanel = $div("subpanel","",parent);
@@ -898,9 +948,57 @@ let Palette = function(){
         }
         daRange.onchange = function(){
             ditherAmount = daRange.value;
+            EventBus.trigger(EVENT.ditherSettingsChanged);
             applyReduce();
         }
         ditherAmountPanel.appendChild(daRange);
+
+        // Grain = feature size in pixels for the noise-based procedural dithers. Only the
+        // entries that declare grain:true read it; for the rest their fixed scale applies
+        // and the row stays hidden.
+        let ditherGrainPanel = $div("subpanel","",parent);
+        $div("label","Grain",ditherGrainPanel);
+        let dgValue = $div("value","",ditherGrainPanel);
+        let dgRange = document.createElement("input");
+        dgRange.type = "range";
+        dgRange.min = 1;
+        dgRange.max = 32;
+        dgRange.oninput = function(){
+            dgValue.innerHTML = dgRange.value + "px";
+        }
+        dgRange.onchange = function(){
+            ditherGrain = parseInt(dgRange.value);
+            EventBus.trigger(EVENT.ditherSettingsChanged);
+            applyReduce();
+        }
+        ditherGrainPanel.appendChild(dgRange);
+        updateDitherGrainPanel();
+
+        // Variance = how much of a stamp pool's shape-size range to draw from. Only the
+        // stamp scatter dithers have a shape pool, so the row is hidden for everything else.
+        let ditherVariancePanel = $div("subpanel","",parent);
+        $div("label","Variance",ditherVariancePanel);
+        let dvValue = $div("value","",ditherVariancePanel);
+        let dvRange = document.createElement("input");
+        dvRange.type = "range";
+        dvRange.min = 0;
+        dvRange.max = 100;
+        dvRange.oninput = function(){
+            dvValue.innerHTML = dvRange.value + "%";
+        }
+        dvRange.onchange = function(){
+            ditherVariance = parseInt(dvRange.value);
+            EventBus.trigger(EVENT.ditherSettingsChanged);
+            applyReduce();
+        }
+        ditherVariancePanel.appendChild(dvRange);
+        updateDitherVariancePanel();
+
+        // any image can serve as a dither threshold map (1-bit line/dot screens, Bayer maps, ...)
+        let patternRow = $div("buttonrow","",parent);
+        $div("button full","Load Pattern…",patternRow,loadDitherPatternImage);
+        let removePatternButton = $div("button full","Remove Pattern",patternRow,removeSelectedDitherPattern);
+        updateDitherPatternButtons();
 
         let alpha = $div("subpanel","",parent);
         $checkbox("Alpha Threshold",alpha,"label small",(value)=>{
@@ -925,18 +1023,197 @@ let Palette = function(){
         alpha.appendChild(arange);
 
 
-        let button = $div("button full","Apply",parent,applyReduce);
+        let buttonRow = $div("buttonrow","",parent);
+        reduceCancelButton = $div("button full","Cancel",buttonRow,cancelReduce);
+        reduceApplyButton = $div("button full","Apply",buttonRow,commitReduce);
+        reducePaletteSelect = pselect;
+        updateReducePanelState();
+
+        // `options` is the live dithering array, so it already reflects added/removed patterns
+        function fillDitherOptions(){
+            select.innerHTML = "";
+            options.forEach((o,index)=>{
+                let option = document.createElement("option");
+                option.value = index;
+                option.innerHTML = o.label;
+                select.appendChild(option);
+            });
+            // callers that add or remove an entry set select.value themselves right after
+            select.value = ditherIndex;
+        }
+
+        function updateDitherPatternButtons(){
+            if (!removePatternButton) return;
+            removePatternButton.classList.toggle("disabled",!ImageProcessing.isUserDither(select.value));
+        }
+
+        function updateDitherVariancePanel(){
+            if (!ditherVariancePanel) return;
+            let entry = options[parseInt(select.value) || 0];
+            let supported = !!(entry && entry.stamp);
+            ditherVariancePanel.style.display = supported ? "block" : "none";
+            if (!supported) return;
+            dvRange.value = ditherVariance;
+            dvValue.innerHTML = dvRange.value + "%";
+        }
+
+        function updateDitherGrainPanel(){
+            if (!ditherGrainPanel) return;
+            let entry = options[parseInt(select.value) || 0];
+            let supported = !!(entry && entry.grain);
+            ditherGrainPanel.style.display = supported ? "block" : "none";
+            if (!supported) return;
+            // no explicit grain yet: show the entry's own default
+            dgRange.value = ditherGrain || entry.scale;
+            dgValue.innerHTML = dgRange.value + "px";
+        }
+
+        function loadDitherPatternImage(){
+            let input = document.createElement("input");
+            input.type = "file";
+            input.accept = "image/*";
+            input.onchange = (e)=>{
+                let file = e.target.files && e.target.files[0];
+                if (!file) return;
+                let url = URL.createObjectURL(file);
+                let img = new Image();
+                img.onload = ()=>{
+                    URL.revokeObjectURL(url);
+                    let max = ImageProcessing.MAX_DITHER_PATTERN_SIZE;
+                    if (img.width>max || img.height>max){
+                        Modal.alert("A dither pattern can be at most " + max + "x" + max + " pixels, but this image is " + img.width + "x" + img.height + ".","Pattern too large");
+                        return;
+                    }
+                    let label = file.name.replace(/\.[^.]+$/,"") || "Pattern";
+                    let index = ImageProcessing.addPatternDither(label,matrixFromImage(img));
+                    if (index<0){
+                        Modal.alert("No dither pattern could be read from this image.","Invalid pattern");
+                        return;
+                    }
+                    fillDitherOptions();
+                    select.value = index;
+                    select.onchange();
+                };
+                img.onerror = ()=>{
+                    URL.revokeObjectURL(url);
+                    Modal.alert("This file could not be read as an image.","Invalid pattern");
+                };
+                img.src = url;
+            };
+            input.click();
+        }
+
+        // a pattern image is a threshold map: each pixel's luminance becomes one matrix value
+        function matrixFromImage(img){
+            let c = document.createElement("canvas");
+            c.width = img.width;
+            c.height = img.height;
+            let cctx = c.getContext("2d");
+            cctx.drawImage(img,0,0);
+            let data = cctx.getImageData(0,0,c.width,c.height).data;
+            let values = [];
+            for (let i = 0; i<data.length; i+=4){
+                values.push(Math.round(data[i]*0.299 + data[i+1]*0.587 + data[i+2]*0.114));
+            }
+            let matrix = {width: c.width, height: c.height, values: values};
+            releaseCanvas(c);
+            return matrix;
+        }
+
+        function removeSelectedDitherPattern(){
+            let index = parseInt(select.value);
+            if (!ImageProcessing.removePatternDither(index)) return;
+            fillDitherOptions();
+            // the entry is gone: land on whatever took its place, or on the new last entry
+            select.value = Math.min(index,options.length-1);
+            select.onchange();
+        }
 
         function applyReduce(){
+            if (isLockedGlobal){
+                // palette lock is on: the panel settings only feed the locked-palette
+                // rendering (e.g. the effect-panel dither preview), don't reduce the image
+                EventBus.trigger(EVENT.layerContentChanged);
+                return;
+            }
+            startReducePreview();
             if (pselect.value === "current") targetPalette = currentPalette;
             me.reduce();
         }
+
+        function commitReduce(){
+            if (isLockedGlobal) return;
+            if (reducePreview && !reduceProcessing){
+                finishReduceCommit();
+            }else{
+                // nothing previewed yet (or a reduce is still running):
+                // run/await the reduction and commit when processing finishes
+                reducePendingCommit = true;
+                if (!reducePreview) applyReduce();
+            }
+        }
+    }
+
+    // snapshot the active layer and palette so the live reduce preview can be cancelled
+    function startReducePreview(){
+        if (reducePreview) return;
+        let layer = ImageFile.getActiveLayer();
+        if (!layer) return;
+        reducePreview = {
+            layerIndex: ImageFile.getActiveLayerIndex(),
+            canvas: duplicateCanvas(layer.getCanvas(),true),
+            palette: currentPalette.slice()
+        };
+        updateReducePanelState();
+    }
+
+    function finishReduceCommit(){
+        reducePendingCommit = false;
+        if (!reducePreview) return;
+        let layer = ImageFile.getLayer(reducePreview.layerIndex);
+        if (layer){
+            // the snapshot canvas is handed over to the history stack, don't release it
+            HistoryService.add(EVENT.layerContentHistory,reducePreview.canvas,duplicateCanvas(layer.getCanvas(),true),reducePreview.layerIndex);
+        }
+        reducePreview = null;
+        updateReducePanelState();
+    }
+
+    function cancelReduce(){
+        if (!reducePreview || isLockedGlobal) return;
+        if (reduceProcessing){
+            // a reduce is still running and would repaint the preview right after the
+            // restore: defer the cancel until processing finishes
+            reduceCancelPending = true;
+            return;
+        }
+        reducePendingCommit = false;
+        let layer = ImageFile.getLayer(reducePreview.layerIndex);
+        if (layer){
+            // canvas space: the snapshot is a copy of this layer's own canvas, so it goes back at
+            // pixel 0,0 — drawImage() would read that as layer-LOCAL 0,0 and shift it by the
+            // layer's canvas origin
+            layer.clear();
+            layer.getContext().drawImage(reducePreview.canvas,0,0);
+        }
+        me.set(reducePreview.palette);
+        releaseCanvas(reducePreview.canvas);
+        reducePreview = null;
+        updateReducePanelState();
+        EventBus.trigger(EVENT.paletteChanged);
+        EventBus.trigger(EVENT.layerContentChanged);
+    }
+
+    function updateReducePanelState(){
+        if (reducePaletteSelect) reducePaletteSelect.disabled = isLockedGlobal;
+        if (reduceApplyButton) reduceApplyButton.classList.toggle("disabled",isLockedGlobal);
+        if (reduceCancelButton) reduceCancelButton.classList.toggle("disabled",isLockedGlobal || !reducePreview);
     }
 
     me.openLocal = function(){
         var input = document.createElement('input');
         input.type = 'file';
-        input.accept = ".json,application/json,.png,image/png";
+        input.accept = ".json,application/json,.png,image/png,.txt,text/plain";
         input.onchange = function(e){
             let files = e.target.files;
             if (files.length){
@@ -956,6 +1233,17 @@ let Palette = function(){
                             EventBus.trigger(EVENT.paletteChanged);
                         }
                     }
+                    reader.readAsText(file);
+                }else if (ext === "txt"){
+                    reader.onload = function(){
+                        let palette = parseAmigaTextPalette(reader.result);
+                        if (palette && palette.length){
+                            me.set(palette);
+                            EventBus.trigger(EVENT.paletteChanged);
+                        }else{
+                            console.warn("Selected text file doesn't contain a palette");
+                        }
+                    };
                     reader.readAsText(file);
                 }else if (ext === "png"){
                     reader.onload = function(){
@@ -1261,6 +1549,44 @@ let Palette = function(){
         EventBus.trigger(EVENT.colorDepthChanged);
     }
 
+    // Counterpart of the ".palette.txt" file written next to raw bitplane exports:
+    // a brace-wrapped, comma-separated list of Amiga 12-bit colors, e.g. "{0X0FF,0X123}".
+    // Parsing is deliberately lenient - the braces, the "0X"/"$" prefix and any whitespace
+    // are optional - so hand-edited or source-pasted colour lists load too.
+    function parseAmigaTextPalette(text){
+        if (typeof text !== "string") return null;
+
+        // strip C/asm style comments so a colour table copied out of source code still parses
+        text = text.replace(/\/\*[\s\S]*?\*\//g,"").replace(/(^|\s)(\/\/|;).*/g,"$1");
+
+        let palette = [];
+        let tokens = text.split(/[\s,{}]+/);
+        for (let i = 0; i < tokens.length; i++){
+            let token = tokens[i];
+            if (!token) continue;
+            let match = /^(?:0[xX]|\$)?([0-9a-fA-F]+)$/.exec(token);
+            if (!match) return null;
+            let hex = match[1];
+            let color;
+            if (hex.length <= 3){
+                // 12-bit: one nibble per channel, scaled back to 8 bit (0xF -> 0xFF)
+                hex = hex.padStart(3,"0");
+                color = [0,1,2].map(c=>{
+                    let v = parseInt(hex[c],16);
+                    return (v<<4) | v;
+                });
+            }else if (hex.length <= 6){
+                hex = hex.padStart(6,"0");
+                color = [0,2,4].map(c=>parseInt(hex.substr(c,2),16));
+            }else{
+                return null;
+            }
+            palette.push(color);
+        }
+
+        return palette.length ? palette : null;
+    }
+
     function parseIndexedPngPalette(buffer){
         if (!buffer || buffer.byteLength < 8) return null;
 
@@ -1366,6 +1692,7 @@ let Palette = function(){
     })
 
     EventBus.on(EVENT.paletteProcessingStart,()=>{
+        reduceProcessing = true;
         perf.start = performance.now();
         if (colorReducePanel){
             colorReducePanel.classList.add("waiting");
@@ -1377,6 +1704,7 @@ let Palette = function(){
     })
 
     EventBus.on(EVENT.paletteProcessingEnd,()=>{
+        reduceProcessing = false;
         if (colorReducePanel){
             colorReducePanel.classList.remove("waiting");
             let spinner = colorReducePanel.querySelector('.spinner');
@@ -1385,12 +1713,20 @@ let Palette = function(){
         perf.end = performance.now();
         perf.time = perf.end - perf.start;
         console.log("Palette processing took " + perf.time + "ms");
+
+        if (reduceCancelPending){
+            reduceCancelPending = false;
+            cancelReduce();
+        }else if (reducePendingCommit){
+            finishReduceCommit();
+        }
     })
 
     EventBus.on(COMMAND.LOCKPALETTE,()=>{
         //isLocked = !isLocked;
         isLockedGlobal = !isLockedGlobal;
         lockButton.classList.toggle("active",isLockedGlobal);
+        updateReducePanelState();
         EventBus.trigger(EVENT.layerContentChanged);
         EventBus.trigger(EVENT.paletteLockChanged,isLockedGlobal);
     });

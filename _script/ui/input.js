@@ -10,6 +10,11 @@ import Cursor from "./cursor.js";
 import UI from "./ui.js";
 import Palette from "./palette.js";
 import ToolOptions from "./components/toolOptions.js";
+import {getVectorToolIfLoaded} from "../paintTools/vectorToolLoader.js";
+import LayerPanel from "./toolPanels/layerPanel.js";
+import {isGroup} from "../util/layerUtils.js";
+import DropIndicator from "./dropIndicator.js";
+
 
 var Input = function(){
 	let me = {}
@@ -45,10 +50,17 @@ var Input = function(){
 		window.addEventListener("delete", handleDelete,false);
 		window.addEventListener("dragenter", handleDragEnter,false);
 		window.addEventListener("dragover", handleDragOver,false);
+		window.addEventListener("dragleave", handleDragLeave,false);
 		window.addEventListener("drop", handleDrop,false);
+		window.addEventListener("dragend", handleDragEnd,false);
 
 		EventBus.on(COMMAND.COPY,handleCopy);
 		EventBus.on(COMMAND.PASTE,handlePaste);
+		EventBus.on(EVENT.modifierKeyChanged, function(){
+			if (DropIndicator.isVisible()){
+				DropIndicator.update(me.isShiftDown());
+			}
+		});
 	}
 
 	me.isSpaceDown = function(){
@@ -290,7 +302,9 @@ var Input = function(){
 	}
 
 	function onKeyDown(e){
+		let VectorTool = getVectorToolIfLoaded();
 		let code = limitKeyCode(e.code);
+		let rawKey = e.key;
 		let key = e.key;
 		if (key) key = key.toLowerCase();
 
@@ -299,10 +313,32 @@ var Input = function(){
 		if (me.isAltDown() && !e.altKey) modifierKeyUp("alt");
 		if (keyDown["meta"] && !e.metaKey) modifierKeyUp("meta");
 
-		if (Editor.getCurrentTool() !== COMMAND.TEXT){
+		// Skip the global copy/paste interception below entirely while something is capturing keys
+		// for its own text editing (the raster Text tool, the vector Text tool's caret editing, a
+		// modal, a select box, …) — otherwise isMetaDown() (which treats bare Shift as "meta" too,
+		// see below) steals Shift+C/V/X (or Ctrl+C/V/X) as Copy/Paste before the active handler ever
+		// sees the keystroke, so typing an uppercase C/V/X into a text object silently does nothing.
+		if (!activeKeyHandler){
 			if (Input.isMetaDown()){
 				if (code === "keyc" || code === "keyx" || code === "keyv"){
-					// allow default copy, cut, paste
+					// If an editable element (input/textarea/code) is focused, let the browser
+					// handle copy/cut/paste natively so normal text editing keeps working.
+					if (isEditableTarget(document.activeElement)) return;
+
+					// Otherwise route copy/paste through the async Clipboard API from THIS keydown
+					// gesture. We must not let the native "copy"/"paste" events fire: Safari throws
+					// NotAllowedError when navigator.clipboard.* is called inside those events.
+					if (code === "keyc"){
+						e.preventDefault();
+						EventBus.trigger(COMMAND.COPY);
+						return;
+					}
+					if (code === "keyv"){
+						e.preventDefault();
+						EventBus.trigger(COMMAND.PASTE);
+						return;
+					}
+					// cut (keyx): keep default browser behaviour
 					return;
 				}
 
@@ -325,7 +361,10 @@ var Input = function(){
 
 
 		if (activeKeyHandler){
-			let handled = activeKeyHandler(code,key);
+			// rawKey keeps the OS/layout-resolved case (so Shift+C arrives as "C", not lowercased
+			// away like `key`) — text-editing handlers (vector/pixel text tools) need it to type the
+			// actual character the user pressed instead of guessing case off an unrelated modifier.
+			let handled = activeKeyHandler(code,key,rawKey);
 			if (handled) return;
 		}
 
@@ -333,7 +372,12 @@ var Input = function(){
 		switch (code){
 			case "delete":
 			case "backspace":
-				EventBus.trigger(COMMAND.CLEAR);
+				// on a vector layer, Delete removes the selected point/shape instead of clearing pixels
+				if (VectorTool?.isActive()){
+					EventBus.trigger(COMMAND.VECTORDELETE);
+				}else{
+					EventBus.trigger(COMMAND.CLEAR);
+				}
 				break;
 			case "escape":
 				// TODO should we tie this to the selected tool?
@@ -392,21 +436,27 @@ var Input = function(){
 				switch (key){
 					case "a": EventBus.trigger(COMMAND.LAYERMASK); break;
 					case "f": EventBus.trigger(COMMAND.FLATTEN); break;
+					case "g": if (isGroup(ImageFile.getActiveLayer())) EventBus.trigger(COMMAND.UNGROUP); break;
 					case "h": EventBus.trigger(COMMAND.LAYERMASKHIDE); break;
 					case "i": EventBus.trigger(COMMAND.INVERTSELECTION); break;
 					case "l": EventBus.trigger(COMMAND.TOSELECTION); break;
 					case "p": EventBus.trigger(COMMAND.COLORSELECT); break;
 					case "r": EventBus.trigger(COMMAND.TOGGLERULERS); break;
+					case "s": EventBus.trigger(COMMAND.SAVEAS); break;
 					case "x": EventBus.trigger(COMMAND.INFO); break;
 					case "arrowdown": EventBus.trigger(COMMAND.MERGEDOWN); break;
 				}
 			}else{
 				switch (key){
-					case "a": EventBus.trigger(COMMAND.SELECTALL); break;
+					// on a vector layer, select all points & lines instead of the pixel rectangle
+					case "a":
+						if (VectorTool?.isActive() && VectorTool.selectAll()) break;
+						EventBus.trigger(COMMAND.SELECTALL);
+						break;
 					case "b": EventBus.trigger(COMMAND.STAMP); break;
 					case "d": EventBus.trigger(COMMAND.DUPLICATELAYER); break;
 					case "e": EventBus.trigger(COMMAND.EFFECTS); break;
-					case "g": EventBus.trigger(COMMAND.TOGGLEGRID); break;
+					case "g": EventBus.trigger(COMMAND.GROUPLAYERS, LayerPanel.getSelectedPaths()); break;
 					case "i": EventBus.trigger(COMMAND.IMPORTLAYER); break;
 					case "j": EventBus.trigger(COMMAND.TOLAYER); break;
 					case "k": EventBus.trigger(COMMAND.CUTTOLAYER); break;
@@ -421,6 +471,9 @@ var Input = function(){
 					case "z": EventBus.trigger(COMMAND.UNDO); break;
 				}
 			}
+		}else if (VectorTool?.isActive() && handleVectorToolKey(key)){
+			// on a vector layer the single-letter tool keys switch the vector SUB-tool (S/L/R/C/B/F/O)
+			// instead of the pixel tools; any key the vector map doesn't claim falls through below.
 		}else{
 			switch (key){
 				//case "a": EventBus.trigger(COMMAND.TOGGLEMASK); break;
@@ -435,7 +488,7 @@ var Input = function(){
 				case "i": EventBus.trigger(COMMAND.TOGGLEINVERT); break;
 				case "k": EventBus.trigger(COMMAND.COLORPICKER); break;
 				case "l": EventBus.trigger(COMMAND.LINE); break;
-				case "m": EventBus.trigger(COMMAND.SMUDGE); break;n
+				case "m": EventBus.trigger(COMMAND.SMUDGE); break;
 				case "n": EventBus.trigger(COMMAND.SPLITSCREEN); break;
 				case "o": EventBus.trigger(COMMAND.SPRAY); break;
 				case "p": EventBus.trigger(COMMAND.POLYGONSELECT); break;
@@ -461,6 +514,24 @@ var Input = function(){
 
 	}
 
+	// Vector-mode single-letter tool shortcuts. Mirrors the pixel-tool keys but switches the active
+	// VectorTool sub-mode (the command also re-highlights the matching toolbar button). Returns true
+	// when the key maps to a vector tool so the caller can skip the pixel-tool switch; false lets keys
+	// the vector tool doesn't use (undo, zoom, pan, colour-pick, …) fall through to the normal handler.
+	function handleVectorToolKey(key){
+		switch (key){
+			case "s": EventBus.trigger(COMMAND.VECTORSELECT); return true;  // Select / edit
+			case "l": EventBus.trigger(COMMAND.VECTORLINE); return true;    // Line
+			case "r": EventBus.trigger(COMMAND.VECTORRECT); return true;    // Rectangle
+			case "c": EventBus.trigger(COMMAND.VECTORCIRCLE); return true;  // Circle / ellipse
+			case "b": EventBus.trigger(COMMAND.VECTORBLOB); return true;    // Blob brush
+			case "f": EventBus.trigger(COMMAND.VECTORFILL); return true;    // Fill
+			case "o": EventBus.trigger(COMMAND.VECTOROUTLINE); return true; // Outline / stroke
+			case "t": EventBus.trigger(COMMAND.VECTORTEXT); return true;    // Text
+		}
+		return false;
+	}
+
 	function onKeyUp(e){
 		let code = limitKeyCode(e.code);
 		keyDown[code] = false;
@@ -483,7 +554,23 @@ var Input = function(){
 		return code.toLowerCase();
 	}
 
+	function isEditableTarget(el){
+		if (!el) return false;
+		const tag = el.tagName ? el.tagName.toLowerCase() : "";
+		return tag === "input" || tag === "textarea" || el.isContentEditable || !!(el.closest && el.closest("code"));
+	}
+
 	function handlePaste(e){
+
+		// Let editable elements handle paste natively (e.g. the filename field in dialogs).
+		if (e && isEditableTarget(e.target)) return;
+
+		// On a vector layer, if we hold an internal vector-point selection, paste it as a detached
+		// floating copy on the same layer (spec 014) instead of pasting a raster image.
+		let VectorTool = getVectorToolIfLoaded();
+		if (VectorTool?.isActive() && VectorTool.hasClipboard()){
+			if (VectorTool.pasteFloating()) return;
+		}
 
 		function pasteImage(blob){
 			let img = new Image();
@@ -498,40 +585,26 @@ var Input = function(){
 		}
 
 		if (!e){
-			// "paste" selected from menu;
-
-			let blob;
-			const queryOpts = { name: 'clipboard-read', allowWithoutGesture: true };
-			navigator.permissions.query(queryOpts).then(permissionStatus=>{
-				// Will be 'granted', 'denied' or 'prompt':
-				console.log(permissionStatus.state);
-				getClipboardContents();
-
-				// Listen for changes to the permission state
-				permissionStatus.onchange = () => {
-					console.log(permissionStatus.state);
-					getClipboardContents();
-				};
-
-
-				async function getClipboardContents() {
-					if (permissionStatus.state === "granted") {
-						try {
-							const clipboardItems = await navigator.clipboard.read();
-							for (const clipboardItem of clipboardItems) {
-								for (const type of clipboardItem.types) {
-									if (!blob && type.indexOf('image') !== -1){
-										blob = await clipboardItem.getType(type);
-										pasteImage(blob);
-									}
-								}
+			// "paste" selected from menu or triggered via the Cmd/Ctrl+V keyboard gesture.
+			// Read the clipboard directly inside the gesture. We deliberately do NOT use
+			// navigator.permissions.query({name:'clipboard-read'}): Safari doesn't support that
+			// permission name and rejects with a TypeError (the "unhandled promise rejection").
+			if (navigator.clipboard && navigator.clipboard.read){
+				navigator.clipboard.read().then(async (clipboardItems)=>{
+					for (const clipboardItem of clipboardItems){
+						for (const type of clipboardItem.types){
+							if (type.indexOf("image") !== -1){
+								const blob = await clipboardItem.getType(type);
+								pasteImage(blob);
+								return;
 							}
-						} catch (err) {
-							console.error(err.name, err.message);
 						}
 					}
-				}
-			})
+				}).catch(err=>{
+					console.error(err.name, err.message);
+				});
+			}
+			return;
 		}
 		console.log("paste",e);
 		if (e && e.clipboardData){
@@ -569,23 +642,31 @@ var Input = function(){
 			if (e.target.closest("code")) return;
 		}
 
+		// On a vector layer, a point/line/shape selection copies into the internal vector clipboard
+		// (spec 014) so Cmd-V can duplicate it on the same layer. Skip the raster copy when it took.
+		if (getVectorToolIfLoaded()?.isActive() && getVectorToolIfLoaded().copySelection()) return;
+
 		let canvas = Selection.toCanvas() || ImageFile.getActiveContext().canvas;
 		if (canvas && ClipboardItem){
-			canvas.toBlob((blob) => {
-				// note: As to date, FireFox doesn't support ClipboardItem.
-				let data = [new ClipboardItem({ [blob.type]: blob })];
-
-				navigator.clipboard.write(data).then(
-					() => {
-						console.log("copied");
-					},
-					(err) => {
-						console.error("error");
-						console.error(err);
-						//onError(err);
-					}
-				);
-			});
+			// note: As to date, FireFox doesn't support ClipboardItem.
+			// Safari requires clipboard.write() to be called synchronously within the user gesture
+			// and does not support Promise values in ClipboardItem before Safari 16.4.
+			// Use toDataURL() to build the Blob synchronously so the entire write is in-gesture.
+			const dataUrl = canvas.toDataURL("image/png");
+			const binary = atob(dataUrl.split(",")[1]);
+			const bytes = new Uint8Array(binary.length);
+			for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+			const blob = new Blob([bytes], {type: "image/png"});
+			const data = [new ClipboardItem({"image/png": blob})];
+			navigator.clipboard.write(data).then(
+				() => {
+					console.log("copied");
+				},
+				(err) => {
+					console.error("error");
+					console.error(err);
+				}
+			);
 		}
 	}
 
@@ -601,25 +682,66 @@ var Input = function(){
 		console.log("delete");
 	}
 
+	let dragDepth = 0;
+
+	function isFileDrag(e){
+		if (!e || !e.dataTransfer) return false;
+		let types = e.dataTransfer.types;
+		if (!types || !types.length) return true;
+		return types.includes ? types.includes("Files") : Array.from(types).indexOf("Files") >= 0;
+	}
+
 	function handleDragEnter(e) {
 		e.stopPropagation();
 		e.preventDefault();
+		dragDepth++;
+		let isShift = !!(e && (e.shiftKey || me.isShiftDown()));
+		if (e.dataTransfer) {
+			e.dataTransfer.dropEffect = isShift ? "copy" : "move";
+		}
+		if (isFileDrag(e)){
+			DropIndicator.show(isShift);
+		}
 	}
 
 	function handleDragOver(e){
 		e.stopPropagation();
 		e.preventDefault();
+		let isShift = !!(e && (e.shiftKey || me.isShiftDown()));
+		if (e.dataTransfer) {
+			e.dataTransfer.dropEffect = isShift ? "copy" : "move";
+		}
+		if (isFileDrag(e)){
+			DropIndicator.show(isShift);
+			DropIndicator.update(isShift);
+		}
+	}
+
+	function handleDragLeave(e){
+		e.stopPropagation();
+		e.preventDefault();
+		dragDepth--;
+		if (dragDepth <= 0){
+			dragDepth = 0;
+			DropIndicator.hide();
+		}
+	}
+
+	function handleDragEnd(){
+		dragDepth = 0;
+		DropIndicator.hide();
 	}
 
 	function handleDrop(e){
 		e.preventDefault();
-		//console.error("Drop");
-		//console.error(e);
+		dragDepth = 0;
+		DropIndicator.hide();
 
 		var dt = e.dataTransfer;
-		var files = dt.files;
+		var files = dt ? dt.files : null;
 
-		ImageFile.handleUpload(files,"file")
+		var target = (e && (e.shiftKey || me.isShiftDown())) ? "frame" : "file";
+		ImageFile.handleUpload(files, target);
 
 	}
 	

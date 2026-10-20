@@ -6,24 +6,23 @@ import EventBus from "../../util/eventbus.js";
 import {COMMAND} from "../../enum.js";
 import BinaryStream from "../../util/binarystream.js";
 import IFF from "../../fileformats/iff.js";
-import SaveDialog from "./saveDialog.js";
+import {setCurrentFileHandle} from "../currentFileHandle.js";
 import Generate from "../../fileformats/generate.js";
+import PanelManager from "../panelManager.js";
 
 let FileBrowser = function(){
     let me = {};
-    let container;
     let listContainer;
     let diskInfo;
     let currentFile;
+    let pendingRoot;   // folder to render once the panel content exists
 
-    me.show = function(){
-        document.body.classList.add("withfilebrowser");
-        if (container) container.classList.add("active");
-    }
-
-    me.hide = function(){
-        document.body.classList.remove("withfilebrowser");
-        if (container) container.classList.remove("active");
+    // Content generator for the free-panel system: renders the ADF listing into the
+    // panel content area. The panel chrome/caption is owned by PanelManager.
+    me.generate = function(parent){
+        listContainer = $(".filebrowser-content", {parent:parent}, $(".list")).querySelector(".list");
+        if (pendingRoot){ listFolder(pendingRoot); pendingRoot = undefined; }
+        return listContainer;
     }
 
     me.openAdf = (files)=>{
@@ -34,10 +33,15 @@ let FileBrowser = function(){
                 Adf.loadDisk(reader.result,result=>{
                     if (result){
                         diskInfo = Adf.getInfo();
-                        if (!container) generate();
-                        me.show();
                         let root = Adf.readRootFolder();
-                        listFolder(root);
+                        if (listContainer){
+                            PanelManager.reveal("adf", true);
+                            listFolder(root);
+                        }else{
+                            // content not generated yet → render on first show
+                            pendingRoot = root;
+                            PanelManager.reveal("adf", true);
+                        }
                     }else{
                         Modal.alert("Sorry, this doesn't seem to be an ADF file.","Error reading disk file");
                     }
@@ -48,19 +52,8 @@ let FileBrowser = function(){
         }
     }
 
-    function generate(){
-        let parent = document.querySelector(".container");
-        container = $(".filebrowser",
-            {parent:parent},
-            $(".caption","File Browser",$(".close",{
-                onclick:()=>{
-                    me.hide();
-                },info:"Close File Browser"},"x")),
-            listContainer = $(".list")
-        );
-    }
-
     function listFolder(root){
+        if (!listContainer) { pendingRoot = root; return; }
         listContainer.innerHTML = "";
 
         listContainer.appendChild($(".disk",diskInfo.label || "Disk",$(".download",{
@@ -125,8 +118,7 @@ let FileBrowser = function(){
     function openFile(file){
         currentFile = file;
         let f = Adf.readFileAtSector(file.sector,true);
-        ImageFile.handleBinary(f.content.buffer,file.name,"file",true);
-        SaveDialog.setFile(file);
+        ImageFile.handleBinary(f.content.buffer,file.name,"file",true,()=>setCurrentFileHandle(file));
     }
 
     EventBus.on(COMMAND.SAVEFILETOADF,([currentFile,name])=>{
@@ -148,7 +140,7 @@ let FileBrowser = function(){
                         // update current file in dpaint.js
                         let f = Adf.readFileAtSector(sector,false);
                         currentFile=f;
-                        SaveDialog.setFile(f);
+                        setCurrentFileHandle(f);
                         Modal.hide();
                     }
                 });

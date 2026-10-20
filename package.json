@@ -7,15 +7,23 @@
     "license": "MIT",
     "scripts": {
         "clean": "rm -rf dist && rm -rf .parcel-cache",
-        "cleanwin": "del /q .\\.parcel-cache\\* && del /q .\\dist\\*",
-        "build": "vite build --base=./",
+        "cleanwin": "del /q .\\dist\\*",
+        "build": "vite build --base=./ --outDir dist_test",
+        "deploy": "vite build --base=./",
         "start": "npx http-server",
-        "test": "playwright test --config ./tests/playwright.config.js"
+        "test": "playwright test --config ./tests/playwright.config.js",
+        "check:lazy-chunks": "node scripts/check-lazy-chunks.mjs"
     },
     "source": "index.html",
     "devDependencies": {
         "@playwright/test": "^1.58.2",
         "playwright": "^1.58.2",
+        "playwright-core": "^1.58.2",
         "vite": "^7.3.1"
+    },
+    "dependencies": {
+        "mp4-muxer": "^5.2.2",
+        "opentype.js": "^2.0.0",
+        "webm-muxer": "^5.1.4"
     }
 }

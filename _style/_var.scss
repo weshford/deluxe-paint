@@ -1,3 +1,8 @@
+// Shared spacing between adjacent panel/editor regions (toolbar↔sidepanel, sidepanel↔editor,
+// and the split-view divider gap) so they read as one consistent grid.
+$toolbar-width: 64px;
+$panel-gap: 4px;
+
 $background-color: #2B2B2B;
 $panel-background-color: #313335;
 $panel-background-active: #3C3F41;
@@ -24,4 +29,51 @@ $positive-background: #313c31;
   image-rendering: -o-crisp-edges;
   image-rendering: pixelated;
   -ms-interpolation-mode: nearest-neighbor;
+}
+
+// A clickable control in a panel caption (collapse caret, options "⋮", close "x"). The
+// caption itself is the panel's drag handle (`cursor: move`), so each button must restate
+// the pointer cursor; all three share one dimmed → opaque-on-hover affordance.
+@mixin caption-button{
+  cursor: pointer;
+  opacity: 0.6;
+
+  &:hover{
+    opacity: 1;
+  }
+}
+
+// Standard bordered button chrome (border + padding + hover). Single source of truth for
+// the look that used to live only under `.modalwindow .inner .button`; free-panel editors
+// `@include` it instead of re-declaring the border/hover colours.
+@mixin button-chrome{
+  border: 1px solid #6a6a6a;
+  padding: 6px;
+  user-select: none;
+
+  &:hover{
+    cursor: pointer;
+    border: 1px solid #8c8c8c;
+    background-color: #232323;
+  }
+}
+
+// Marching-ants marquee: a white base stroke with an animated black dashed stroke on top. Shared
+// by the pixel selection box (_selection.scss) and the vector-editing rubber-band (_editor.scss) so
+// the look (dash size, speed) has a single source of truth. Relies on the global `@keyframes stroke`.
+@mixin marching-ants-white{
+  fill: none;
+  stroke: #FFF;
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+}
+
+@mixin marching-ants-black{
+  fill: none;
+  stroke: #000;
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+  stroke-dasharray: 4px;
+  stroke-dashoffset: 8px;
+  animation: stroke 0.2s linear infinite;
 }

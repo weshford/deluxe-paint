@@ -11,11 +11,12 @@ import Color from "../../util/color.js";
 import BinaryStream from "../../util/binarystream.js";
 import ImageProcessing from "../../util/imageProcessing.js";
 import UserSettings from "../../userSettings.js";
+import {setCurrentFileHandle, getCurrentFileHandle} from "../currentFileHandle.js";
+import {rememberFile} from "../../util/recentFiles.js";
 
 var SaveDialog = function(){
     let me ={};
     let nameInput;
-    let currentFile;
     let container;
     let mainPanel;
     let imageinfo;
@@ -25,6 +26,10 @@ var SaveDialog = function(){
         depth: 24,
         palette: "optimized",
         iconType: "colorIcon",
+        spriteFormat: "code",
+        gifMode: "animation",
+        videoFormat: "mp4",
+        videoScale: 1,
         compression: true  // Default to compressed for ANIM files
     };
     let UIelm = {};
@@ -50,6 +55,8 @@ var SaveDialog = function(){
         },
         PLANES:{
             description: 'Binary Bitplane Data',
+            extension: "planes",
+            generator: "BitPlanes",
             accept: {
                 'application/octet-stream': ['.planes'],
             }
@@ -74,6 +81,25 @@ var SaveDialog = function(){
             generator: "SPRITE",
             accept: {
                 'application/octet-stream': ['.c'],
+            },
+            // The sprite exporter writes either C source or a binary sprite bank,
+            // so its extension follows the "Output" option instead of being fixed.
+            variantKey: "spriteFormat",
+            variants: {
+                code: {
+                    description: 'Sprite C Source',
+                    extension: "c",
+                    accept: {
+                        'application/octet-stream': ['.c'],
+                    }
+                },
+                binary: {
+                    description: 'Amiga Sprite Bank',
+                    extension: "spr",
+                    accept: {
+                        'application/octet-stream': ['.spr'],
+                    }
+                }
             }
         },
         PNG:{
@@ -92,12 +118,67 @@ var SaveDialog = function(){
                 'application/octet-stream': ['.psd'],
             }
         },
+        SVG:{
+            description: 'SVG Vector',
+            extension: 'svg',
+            generator: 'SVG',
+            accept: {
+                'image/svg+xml': ['.svg'],
+            }
+        },
+        PDF:{
+            description: 'PDF Document',
+            extension: 'pdf',
+            generator: 'PDF',
+            accept: {
+                'application/pdf': ['.pdf'],
+            }
+        },
         GIF:{
             description: 'GIF Image',
             generator: "GIF",
             extension: 'gif',
             accept: {
                 'image/gif': ['.gif'],
+            },
+            // Same .gif either way; only the description follows the "Output" option.
+            variantKey: "gifMode",
+            variants: {
+                animation: {description: 'GIF Animation'},
+                frame: {description: 'GIF Image'}
+            }
+        },
+        VIDEO:{
+            description: 'MP4 Video',
+            generator: "VIDEO",
+            extension: 'mp4',
+            accept: {
+                'video/mp4': ['.mp4'],
+            },
+            variantKey: "videoFormat",
+            variants: {
+                mp4: {
+                    description: 'MP4 Video',
+                    extension: 'mp4',
+                    accept: {
+                        'video/mp4': ['.mp4'],
+                    }
+                },
+                webm: {
+                    description: 'WebM Video',
+                    extension: 'webm',
+                    accept: {
+                        'video/webm': ['.webm'],
+                    }
+                }
+            }
+        },
+        PCX:{
+            description: 'PCX Image',
+            extension: 'pcx',
+            generator: 'PCX',
+            accept: {
+                'image/x-pcx': ['.pcx'],
             }
         },
         JPG:{
@@ -147,33 +228,32 @@ var SaveDialog = function(){
         },
     }
 
-     function saveFile(blob,fileName,type) {
-        return new Promise(async (resolve,reject)=>{
-            if (window.host && window.host.saveFile){
-                window.host.saveFile(blob,fileName);
-                resolve();
-                return;
-            }
-
-            if (window.showSaveFilePicker){
-                window.showSaveFilePicker({
+    async function saveFile(blob,fileName,type) {
+        if (window.host && window.host.saveFile){
+            await window.host.saveFile(blob,fileName);
+            return;
+        }
+        if (window.showSaveFilePicker){
+            try {
+                const handle = await window.showSaveFilePicker({
                     suggestedName: fileName,
                     types: [type],
-                }).then(async handle => {
-                    const writableStream = await handle.createWritable();
-                    await writableStream.write(blob);
-                    await writableStream.close();
-                    resolve();
-                }).catch(async err => {
-                    console.error(err);
-                    await saveAs(blob,fileName);
-                    resolve();
                 });
-            }else{
-                await saveAs(blob,fileName);
-                resolve();
+                const stream = await handle.createWritable();
+                try {
+                    await stream.write(blob);
+                    await stream.close();
+                } catch (error){
+                    try { await stream.abort(); } catch {}
+                    throw error;
+                }
+                return handle;
+            } catch (error){
+                if (error.name === "AbortError") return false;
+                throw error;
             }
-        });
+        }
+        await saveAs(blob,fileName);
     }
 
     me.render = function(_container){
@@ -201,17 +281,19 @@ var SaveDialog = function(){
                                         menu = $(".menu",
                                             $(".list",
                                                 renderButton("json","DPaint.JSON","The internal format of Dpaint. All features supported","DPAINTJS"),
-                                                renderButton("png","PNG Image","Full color and transparency, no layers, only the current frame gets saved.","PNG"),
+                                                renderButton("png","PNG Image","Full color and transparency, no layers, current frame only.","PNG"),
                                                 renderButton("psd","PSD Image","Basic layered PSD export, current frame only.","PSD"),
+                                                renderButton("svg","SVG Vector","Vector layers as true SVG paths, pixel layers embedded, current frame only.","SVG"),
+                                                renderButton("pdf","PDF Document","Single page raster image, no layers, current frame only.","PDF"),
                                                 renderButton("gif","GIF Img/anim","Max 256 colors, no layers, animation supported.","GIF"),
-                                                renderButton("jpg","JPG Image","Full color, no transparency, no layers, only the current frame gets saved. LOSSY!","JPG"),
-                                                renderButton("iff","Amiga IFF","Maximum 256 colors, only the current frame gets saved.","IFF"),
+                                                renderButton("video","Video","MP4 or WebM video, timeline animation supported.","VIDEO"),
+                                                renderButton("jpg","JPG Image","Full color, no transparency, no layers, current frame only. LOSSY!","JPG"),
+                                                renderButton("pcx","PCX Image","indexed or true color, no layers, no transparency, current frame only.","PCX"),
+                                                renderButton("iff","Amiga IFF","Maximum 256 colors, current frame only.","IFF"),
                                                 renderButton("anim","Amiga ANIM","Maximum 256 colors, animation supported.","ANIM"),
                                                 renderButton("os3","Amiga Icon","Amiga OS Icon, Maximum 2 frames.","ICO"),
-                                                renderButton("amiga","Amiga Sprite","C Source.","SPRITE"),
-                                                //renderButton("planes","Bitplanes","Separate bitplane images","PLANEIMAGES")
-
-                                                //renderButton("planes","BIN","Bitplanes","Binary bitplane data",writePLANES)
+                                                renderButton("amiga","Amiga Sprite","C source or binary sprite bank.","SPRITE"),
+                                                renderButton("planes","Bitplanes","Binary bitplane data","PLANES")
                                             )
                                         ),
                                         UIelm.ext = $(".ext"),
@@ -254,7 +336,38 @@ var SaveDialog = function(){
                         ),
                         $(".optionspanel.GIF",
                             $(".content",
-                                ""
+                                // Hidden for a single-frame document, where the two are the
+                                // same file -- see setSaveType.
+                                UIelm.gifOutput = $(".group",
+                                    $("label","Output"),
+                                    $(".options",
+                                        {key:"gifMode"},
+                                        $(".option.selected",{value:"animation",onClick:selectOption},"Animation",$(".tooltip.left",$("div","One GIF frame per timeline frame."),$("div","Frame delay follows the timeline fps."))),
+                                        $(".option",{value:"frame",onClick:selectOption},"Frame",$(".tooltip.left",$("div","A still image of the frame under the playhead.")))
+                                    )
+                                )
+                            )
+                        ),
+                        $(".optionspanel.VIDEO",
+                            $(".content",
+                                $(".group",
+                                    $("label","Format"),
+                                    $(".options.inline",
+                                        {key:"videoFormat"},
+                                        $(".option.selected",{value:"mp4",onClick:selectOption},"MP4",$(".tooltip.left",$("div","H.264 / MP4 video container."),$("div","Widely compatible with players and browsers."))),
+                                        $(".option",{value:"webm",onClick:selectOption},"WebM",$(".tooltip.left",$("div","VP9 / WebM video container.")))
+                                    )
+                                ),
+                                $(".group",
+                                    $("label","Scale"),
+                                    $(".options.inline",
+                                        {key:"videoScale"},
+                                        $(".option.selected",{value:1,onClick:selectOption},"1x",$(".tooltip.left",$("div","Original size (no scaling)."))),
+                                        $(".option",{value:2,onClick:selectOption},"2x",$(".tooltip.left",$("div","2x nearest-neighbor scaling."))),
+                                        $(".option",{value:3,onClick:selectOption},"3x",$(".tooltip.left",$("div","3x nearest-neighbor scaling."))),
+                                        $(".option",{value:4,onClick:selectOption},"4x",$(".tooltip.left",$("div","4x nearest-neighbor scaling.")))
+                                    )
+                                )
                             )
                         ),
                         $(".optionspanel.DPAINTJS",
@@ -359,12 +472,29 @@ var SaveDialog = function(){
                             $(".content",
                                 $(".group",
                                     $("label","Compression"),
-                                    $(".options",   
+                                    $(".options",
                                         {key:"compression"},
                                         $(".option",{value:false,onClick:selectOption},"Uncompressed",$(".tooltip.left",$("div","results in larger files, but is faster to read."))),
                                         $(".option.selected",{value:true,onClick:selectOption},"Compressed",$(".tooltip.left",$("div","Uses ByteRun1 compression for the bitplane data.")))
                                     )
                                 )
+                            )
+                        ),
+                        $(".optionspanel.SPRITE",
+                            $(".content",
+                                $(".group",
+                                    $("label","Output"),
+                                    $(".options",
+                                        {key:"spriteFormat"},
+                                        $(".option.selected",{value:"code",onClick:selectOption},"Show code",$(".tooltip.left",$("div","C source for one hardware sprite."),$("div","Current frame only."))),
+                                        $(".option",{value:"binary",onClick:selectOption},"Binary file",$(".tooltip.left",$("div","Sprite bank (.spr) with one sprite per frame."),$("div","Loads straight into CHIP RAM.")))
+                                    )
+                                )
+                            )
+                        ),
+                        $(".optionspanel.PCX",
+                            $(".content",
+                                UIelm.pcxInfo = $(".pcxinfo","")
                             )
                         ),
                     ),
@@ -418,7 +548,7 @@ var SaveDialog = function(){
     }
 
     me.setFile = function (file){
-        currentFile = file;
+        setCurrentFileHandle(file);
     }
 
     function toggleOptionPanel(e){
@@ -453,6 +583,11 @@ var SaveDialog = function(){
             }
         }
 
+        let fileType = filetypes[currentSaveOptions.type];
+        if (fileType && parent.key === fileType.variantKey){
+            updateFileTypeInfo();
+        }
+
         if (parent.key === "iffMode"){
             let panel = parent.closest(".optionspanel");
             let paletteOption = panel.querySelector(".group.pal");
@@ -467,6 +602,26 @@ var SaveDialog = function(){
         waitFor(writeFile(),button);
     }
 
+    // Some file types write a different file depending on one of their options
+    // (e.g. Amiga Sprite: C source or a binary sprite bank). Those declare a
+    // variantKey + variants, and the active variant overrides extension/description.
+    function resolveFileType(type){
+        let fileType = filetypes[type];
+        if (!fileType) return;
+        let variant = fileType.variants && fileType.variants[currentSaveOptions[fileType.variantKey]];
+        return variant ? Object.assign({},fileType,variant) : fileType;
+    }
+
+    function updateFileTypeInfo(){
+        let fileType = resolveFileType(currentSaveOptions.type);
+        if (!fileType) return;
+        currentSaveOptions.fileType = fileType;
+
+        UIelm.ext.innerHTML = "." + fileType.extension;
+        UIelm.ext.className = "ext " + fileType.extension;
+        UIelm.info.innerHTML = fileType.description || "";
+    }
+
     function setSaveType(type){
         let fileType = filetypes[type];
         if (!fileType) {
@@ -474,12 +629,9 @@ var SaveDialog = function(){
             return;
         }
         currentSaveOptions.type = type;
-        currentSaveOptions.fileType = fileType;
 
         // Set UI elements
-        UIelm.ext.innerHTML = "." + fileType.extension;
-        UIelm.ext.className = "ext " + fileType.extension;
-        UIelm.info.innerHTML = fileType.description || "";
+        updateFileTypeInfo();
 
         let optionsPanel = mainPanel.querySelector(".optionspanel." + type);
         let active = mainPanel.querySelectorAll(".optionspanel.visible");
@@ -510,6 +662,16 @@ var SaveDialog = function(){
             });
         }
 
+        // Animation vs Frame is only a choice when there is more than one frame to choose
+        // between; with a single frame both write the same file.
+        if (type === "GIF" && UIelm.gifOutput){
+            UIelm.gifOutput.classList.toggle("disabled",!ImageFile.hasMultipleFrames());
+        }
+
+        if (type === "PCX" && UIelm.pcxInfo) {
+            let fmt = Generate.pcxFormat(ImageFile.getCanvas());
+            UIelm.pcxInfo.textContent = fmt.label;
+        }
     }
 
     function renderTextOutput(text){
@@ -530,9 +692,17 @@ var SaveDialog = function(){
     }
 
     function addPostBackOverlay(postBack,container){
+        // The overlay replaces the normal save form. It lives in normal flow (not
+        // absolutely positioned) so the auto-height modal sizes to fit it — same
+        // mechanism that resizes the dialog when you pick e.g. an IFF type. We hide
+        // the form while it's shown; "More options" restores it.
+        if (mainPanel) mainPanel.style.display = "none";
         let overridePanel = $(".saveoverlay",
 
-            $(".info","This editor is configured to save files back to",$("b",postBack.domain), $(".textlink",{onClick:()=>{overridePanel.remove()}},"More options")),
+            $(".info","This editor is configured to save files back to",$("b",postBack.domain), $(".textlink",{onClick:()=>{
+                overridePanel.remove();
+                if (mainPanel) mainPanel.style.display = "";
+            }},"More options")),
             $(".spinner"),
             $(".buttons",
                 $(".button.ghost",{onclick:()=>{
@@ -540,7 +710,10 @@ var SaveDialog = function(){
                 }},"Cancel"),
                 $(".button.primary",{onclick:async ()=>{
                     overridePanel.classList.add("loading");
-                    let blob = await Generate.file("PNG");
+                    // Generate.file returns {result, file: Blob} — send the Blob,
+                    // not the wrapper object (which fetch stringifies to "[object Object]").
+                    let result = await Generate.file("PNG");
+                    let blob = result && result.file;
                     if (blob){
                         fetch(postBack.url,{
                             method: postBack.method,
@@ -588,6 +761,10 @@ var SaveDialog = function(){
                         Modal.hide();
                     }
                 }
+            }).catch(error => {
+                spinner.remove();
+                elm.classList.remove("loading");
+                Modal.alert(error.message, "Could not save file");
             });
         },50);
     }
@@ -598,22 +775,31 @@ var SaveDialog = function(){
     }
 
     async function writeFile(){
+        const document = ImageFile.getCurrentFile();
         let fileType = currentSaveOptions.fileType;
         if (!fileType) {
             console.error("Unknown file type",info.type);
             return;
         }
+        if (currentSaveOptions.type === "PLANES"){
+            return writePLANES();
+        }
         let generator = fileType.generator;
         if (currentSaveOptions.depth === 8){
             if (generator === "PNG") generator = "PNG8";
-            if (generator === "DPAINT") generator = "INDEXED";
+            if (generator === "DPAINT") generator = "DPAINTINDEXED";
         }
         if (generator === "ICO") generator = currentSaveOptions.iconType;
 
         let result = await Generate.file(generator,currentSaveOptions);
         if (result){
             if (result.file){
-                await saveFile(result.file,getFileName() + "." + fileType.extension,fileType);
+                const handle = await saveFile(result.file,getFileName() + "." + fileType.extension,fileType);
+                if (handle === false) return;
+                if (handle && ImageFile.getCurrentFile() === document){
+                    setCurrentFileHandle(handle, generator, {...currentSaveOptions});
+                    rememberFile(handle);
+                }
             }
             if (result.files){
                 for (let i = 0; i < result.files.length; i++) {
@@ -665,6 +851,8 @@ var SaveDialog = function(){
             GIF: "GIF",
             PSD: "PSD",
             IFF: "IFF",
+            PCX: "PCX",
+            PDF: "PDF",
             classicIcon: "ICO",
             colorIcon: "ICO",
             PNGIcon: "ICO",
@@ -679,7 +867,6 @@ var SaveDialog = function(){
 
     async function writePLANES(){
         let result = await Generate.file("BitPlanes");
-        console.error(result);
         if (result && result.planes){
             let blob = new Blob([result.planes], {type: "application/octet-stream"});
             let fileName = getFileName() + '.planes';
@@ -701,8 +888,8 @@ var SaveDialog = function(){
             content = content.slice(0,-1) + "}";
             let blob2 = new Blob([content], {type: "application/octet-stream"});
             await saveFile(blob2,fileName,filetypes.FILE);
-            Modal.hide();
         }
+        return result;
     }
 
     async function writeMASK(){
@@ -723,7 +910,7 @@ var SaveDialog = function(){
         if (outputType === "text"){
             let output = [];
             output.push("static UWORD imagelist[] = {");
-            let frameCount = ImageFile.getCurrentFile().frames.length;
+            let frameCount = ImageFile.getFrameCount();
             console.error(frameCount)
 
             for (let frame = 0; frame < frameCount; frame++){
@@ -751,7 +938,7 @@ var SaveDialog = function(){
             let image = ImageFile.getCanvas();
             let w = image.width;
             let h = image.height;
-            let frameCount = ImageFile.getCurrentFile().frames.length;
+            let frameCount = ImageFile.getFrameCount();
 
             let size = w * h * 2 * frameCount;
 
@@ -797,7 +984,7 @@ var SaveDialog = function(){
     }
 
     function writeADF(){
-        EventBus.trigger(COMMAND.SAVEFILETOADF,[currentFile,getFileName()]);
+        EventBus.trigger(COMMAND.SAVEFILETOADF,[getCurrentFileHandle(),getFileName()]);
     }
 
 

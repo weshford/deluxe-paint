@@ -20,11 +20,17 @@ import Cursor from "./cursor.js";
 import Smudge from "../paintTools/smudge.js";
 import Spray from "../paintTools/spray.js";
 import Text from "../paintTools/text.js";
+import {getMeshWarpIfLoaded} from "../paintTools/meshWarpLoader.js";
+import {getBoneToolIfLoaded} from "../paintTools/boneToolLoader.js";
+import {getVectorToolIfLoaded} from "../paintTools/vectorToolLoader.js";
+import {getVectorSvgShapes} from "../util/vectorUtils.js";
 import GridOverlay from "./components/gridOverlay.js";
 import RulerOverlay from "./components/rulerOverlay.js";
-import PaletteDialog from "./components/paletteDialog.js";
+import {getPaletteClickAction, pickColor} from "./paletteClickAction.js";
 import {resetShaders, runWebGLQuantizer} from "../util/webgl-quantizer.js";
 import UserSettings from "../userSettings.js";
+import visualScheduler from "../services/visualScheduler.js";
+import {stampLine} from "../util/lineKernel.js";
 
 let Canvas = function(parent){
 	let me = {};
@@ -32,6 +38,8 @@ let Canvas = function(parent){
     let ctx;
     let overlayCanvas;
     let overlayCtx;
+    let vectorShapes;       // SVG element rendering "vector"-display-mode layers as TRUE vector shapes
+    let vectorOverlay;      // SVG element for crisp, zoom-independent vector-editing handles
     let touchData={};
     let zoom=1;
     let prevZoom;
@@ -43,6 +51,8 @@ let Canvas = function(parent){
     let drawFunction;
     let containerTransform = {x:0,y:0,startX:0,startY:0, rotation:0, startRotation: 0};
     let currentCursorPoint;
+    let vectorDownPoint; // last pointer-down position in vector geometry space (for double-click line select)
+    let effectDitherPreview = false;
 
     canvas = document.createElement("canvas");
     overlayCanvas = document.createElement("canvas");
@@ -65,8 +75,27 @@ let Canvas = function(parent){
 
     overlayCanvas.className = "overlaycanvas";
     canvas.className = "maincanvas info";
+    // Vector-editing handles (nodes, bezier tangents, rubber-band previews) are drawn as SVG rather
+    // than into the raster overlay canvas, so they stay crisp and constant screen-size at any zoom.
+    // The SVG lives inside the zoomed container (so it pans/zooms with the artwork for free); its
+    // viewBox is the document, and non-scaling strokes + zoom-compensated dot radii keep the
+    // decorations a fixed size on screen regardless of the container's CSS scale.
+    const SVGNS = "http://www.w3.org/2000/svg";
+    vectorOverlay = document.createElementNS(SVGNS,"svg");
+    vectorOverlay.setAttribute("class","vectoroverlay");
+    vectorOverlay.style.display = "none";
+    // "vector"-display-mode layers are painted here as REAL vector shapes (not rasterized): the SVG
+    // sits in the same zoomed container with the document as its viewBox, so its <path>s scale
+    // crisply with zoom for free — a true vector layer, only rasterized on export. It is stacked
+    // directly above the base composite (which, on screen, leaves these layers out — skipVectorDisplay).
+    vectorShapes = document.createElementNS(SVGNS,"svg");
+    vectorShapes.setAttribute("class","vectorshapes");
+    vectorShapes.style.display = "none";
+    syncVectorOverlaySize();
     container.appendChild(canvas);
+    container.appendChild(vectorShapes);
     container.appendChild(overlayCanvas);
+    container.appendChild(vectorOverlay);
     container.appendChild(selectBox.getBox());
     container.appendChild(visualAids);
     wrapper.appendChild(container);
@@ -87,6 +116,13 @@ let Canvas = function(parent){
     panelParent.onDrag = function (x,y,touchData,e) {handle('move', e)}
     panelParent.onDragEnd = function (e) {handle('up', e)}
     panelParent.onDoubleClick = function(e){
+        let VectorTool = getVectorToolIfLoaded();
+        if (VectorTool?.isActive()){
+            // double-click a line → select every line connected to it (uses the last pointer-down
+            // position, since onDoubleClick receives no event coordinates)
+            if (vectorDownPoint) VectorTool.handleDoubleClick(vectorDownPoint, 8/zoom);
+            return;
+        }
         if (Editor.getCurrentTool() === COMMAND.POLYGONSELECT){
             selectBox.endPolySelect(true);
         }
@@ -168,6 +204,7 @@ let Canvas = function(parent){
         let c = ImageFile.getCanvas();
         canvas.width = overlayCanvas.width = c.width;
         canvas.height = overlayCanvas.height = c.height;
+        syncVectorOverlaySize();
         me.update();
         me.zoom(1);
         me.resetPan();
@@ -187,10 +224,159 @@ let Canvas = function(parent){
         rulerOverlay.update();
     });
 
-    EventBus.on(EVENT.imageContentChanged,()=>{
+    // Spec 016 phase 2: the on-screen composite for a full-image change. Repeated
+    // imageContentChanged events can coalesce into a single composite per animation
+    // frame via the visual scheduler when enabled; the default path stays fully
+    // synchronous so existing behaviour and tests are unchanged until the flag is
+    // promoted. Ordered model/history events are never routed through here.
+    function presentMainDisplay(){
+        if (useIncrementalDisplay){
+            let incremental = canPresentIncremental();
+            let rect = pendingDisplayRect;
+            pendingDisplayRect = null;
+            pendingDisplayFull = false;
+            if (incremental){
+                presentIncremental(rect);
+            } else {
+                presentFullRetained();
+            }
+            return;
+        }
+        // legacy default path — byte-identical to the original present
         me.clear();
-        let c = ImageFile.getCanvas();
+        let c = displayComposite();
         if (c) ctx.drawImage(c,0,0);
+        drawVectorShapes();
+    }
+
+    // Spec 016 phase 11 (live wiring): damage-clipped main-display compositing.
+    // Default-off; when on, a freehand brush stroke recomposites only the damaged
+    // document rect into a retained surface and blits just that rect to screen,
+    // instead of a full-document getCanvas per pointer sample (the current hot path,
+    // driven by the image.js layerContentChanged -> imageContentChanged bridge).
+    // Any non-brush change, vector-display layers, a locked global palette, or the
+    // visual scheduler being active forces a full present, so specs 001-015 behaviour
+    // is byte-identical until this flag is promoted.
+    let useIncrementalDisplay = true;
+    let displaySurface = null;       // retained document-sized composite (owned here)
+    let displaySurfaceValid = false; // true once a full present has synced it since last (re)size
+    let pendingDisplayRect = null;   // accumulated damaged DOC-space rect since last present
+    let pendingDisplayFull = false;  // a change we cannot clip -> force a full present
+
+    me.setIncrementalDisplayEnabled = function(enabled){
+        enabled = !!enabled;
+        if (enabled === useIncrementalDisplay) return;
+        useIncrementalDisplay = enabled;
+        displaySurfaceValid = false;
+        pendingDisplayRect = null;
+        pendingDisplayFull = false;
+    };
+    me.isIncrementalDisplayEnabled = function(){ return useIncrementalDisplay; };
+
+    function ensureDisplaySurface(){
+        if (!displaySurface) displaySurface = document.createElement("canvas");
+        if (displaySurface.width !== canvas.width || displaySurface.height !== canvas.height){
+            displaySurface.width = canvas.width;
+            displaySurface.height = canvas.height;
+            displaySurfaceValid = false;
+        }
+        return displaySurface;
+    }
+
+    function unionDocRect(a,b){
+        if (!b) return a;
+        if (!a) return {x:b.x, y:b.y, width:b.width, height:b.height};
+        let x0 = Math.min(a.x, b.x);
+        let y0 = Math.min(a.y, b.y);
+        let x1 = Math.max(a.x + a.width, b.x + b.width);
+        let y1 = Math.max(a.y + a.height, b.y + b.height);
+        return {x:x0, y:y0, width:x1-x0, height:y1-y0};
+    }
+
+    // expand a layer-local brush footprint by a small halo (covers soft-edge/AA bleed),
+    // map it to document space via the active layer's resolved offset, clamp to the
+    // document bounds. Returns null when the mapping is unsafe (group transform / bones)
+    // or the rect falls fully outside the document, signalling a full present.
+    function damageToDocRect(localRect){
+        if (!localRect) return null;
+        const halo = 2;
+        let padded = {
+            x: Math.floor(localRect.x) - halo,
+            y: Math.floor(localRect.y) - halo,
+            width: Math.ceil(localRect.width) + halo*2,
+            height: Math.ceil(localRect.height) + halo*2
+        };
+        let doc = ImageFile.getActiveLayerDocRect(padded);
+        if (!doc) return null;
+        let x0 = Math.max(0, Math.floor(doc.x));
+        let y0 = Math.max(0, Math.floor(doc.y));
+        let x1 = Math.min(canvas.width, Math.ceil(doc.x + doc.width));
+        let y1 = Math.min(canvas.height, Math.ceil(doc.y + doc.height));
+        if (x1 <= x0 || y1 <= y0) return null;
+        return {x:x0, y:y0, width:x1-x0, height:y1-y0};
+    }
+
+    function accumulateDamage(localFootprint){
+        let docRect = damageToDocRect(localFootprint);
+        if (!docRect){ pendingDisplayFull = true; return; }
+        pendingDisplayRect = unionDocRect(pendingDisplayRect, docRect);
+    }
+
+    function canPresentIncremental(){
+        return useIncrementalDisplay
+            && !useVisualScheduler        // avoid the coalescing hazard: scheduler may defer past non-draw changes
+            && !pendingDisplayFull
+            && !!pendingDisplayRect
+            && displaySurfaceValid
+            && !!displaySurface
+            && displaySurface.width === canvas.width
+            && displaySurface.height === canvas.height
+            && !ImageFile.hasVectorDisplayLayers()
+            && !Palette.isLockedGlobal();
+    }
+
+    function presentFullRetained(){
+        let s = ensureDisplaySurface();
+        // full composite into the retained surface (parity-verified against the fast path)
+        ImageFile.getCanvas(undefined, {skipVectorDisplay:true, target:s});
+        me.clear();
+        ctx.drawImage(s,0,0);
+        displaySurfaceValid = true;
+        drawVectorShapes();
+    }
+
+    function presentIncremental(rect){
+        let s = displaySurface;
+        // recomposite ONLY the damaged rect into the retained surface, then blit just
+        // that rect to screen. Outside the clip the surface (and screen) are untouched.
+        ImageFile.getCanvas(undefined, {skipVectorDisplay:true, target:s, clip:rect});
+        ctx.drawImage(s, rect.x, rect.y, rect.width, rect.height, rect.x, rect.y, rect.width, rect.height);
+        // the surface remains a faithful full composite: new inside the clip, unchanged outside.
+    }
+
+    // default-off runtime flag (rollback-friendly rollout, design §11)
+    let useVisualScheduler = false;
+    let unregisterMainView = null;
+
+    me.setVisualSchedulerEnabled = function(enabled){
+        enabled = !!enabled;
+        if (enabled === useVisualScheduler) return;
+        useVisualScheduler = enabled;
+        if (enabled){
+            unregisterMainView = visualScheduler.registerView('main-display', {render: presentMainDisplay});
+        } else if (unregisterMainView){
+            unregisterMainView();
+            unregisterMainView = null;
+        }
+    };
+    me.isVisualSchedulerEnabled = function(){ return useVisualScheduler; };
+
+    EventBus.on(EVENT.imageContentChanged,()=>{
+        if (useVisualScheduler){
+            visualScheduler.invalidate({viewId: 'main-display'});
+        } else {
+            presentMainDisplay();
+        }
     })
 
     EventBus.on(COMMAND.TOGGLEGRID,()=>{
@@ -227,9 +413,8 @@ let Canvas = function(parent){
     EventBus.on(COMMAND.TOSELECTION,()=>{
         if (!parent.isVisible()) return;
         //This is different from COMMAND.SELECTALL as this selects the actual pixels?
-        let layer = ImageFile.getActiveLayer();
         selectBox.activate(COMMAND.TOSELECTION);
-        selectBox.applyCanvas(layer.getCanvas());
+        selectBox.applyCanvas(ImageFile.getActiveLayerDocCanvas());
     });
 
     EventBus.on(EVENT.toolChanged,(tool)=>{
@@ -238,6 +423,49 @@ let Canvas = function(parent){
 
     EventBus.on(EVENT.layerContentChanged,()=>{
        me.applyGlobalFilter();
+    });
+
+    // Mesh Warp draws its grid + control points on the overlay canvas. It fires
+    // meshWarpChanged whenever the grid moves, or when a session starts/ends.
+    EventBus.on(EVENT.meshWarpChanged,()=>{
+        if (!parent.isVisible()) return;
+        drawMeshOverlay();
+    });
+
+    // The bone tool draws its armature (segments, pivots, action-radius rings) on the overlay
+    // canvas, and re-composites the deformed pixels; both are signalled by bonesChanged.
+    EventBus.on(EVENT.bonesChanged,()=>{
+        // drop a lingering radius-handle cursor when the bone tool is no longer active
+        if (!getBoneToolIfLoaded()?.isActive() && Cursor.isCurrent("boneradius")) Cursor.reset();
+        if (!parent.isVisible()) return;
+        // Re-composite the deformed pixels (getCanvas runs the bone pre-pass with the current
+        // poses) so posing shows a live preview, then repaint the armature on the overlay.
+        me.clear();
+        let c = displayComposite();
+        if (c) ctx.drawImage(c,0,0);
+        me.applyGlobalFilter();
+        drawVectorShapes();
+        drawBoneOverlay();
+    });
+
+    // The vector tool draws its geometry handles (nodes, bezier tangents, rubber-band previews) on
+    // the overlay canvas; a geometry change also marks the layer's raster cache dirty, so the
+    // re-composite here paints the freshly rasterized shapes. Both are signalled by vectorChanged.
+    EventBus.on(EVENT.vectorChanged,()=>{
+        if (!parent.isVisible()) return;
+        me.clear();
+        let c = displayComposite();
+        if (c) ctx.drawImage(c,0,0);
+        me.applyGlobalFilter();
+        drawVectorShapes();
+        drawVectorOverlay();
+    });
+
+    // while the effect dialog is open its changes get the dithered locked-palette
+    // preview; regular drawing keeps the plain (undithered) quantized view
+    EventBus.on(EVENT.effectPreviewChanged,(active)=>{
+        effectDitherPreview = !!active;
+        if (Palette.isLockedGlobal()) me.update();
     });
 
     EventBus.on(EVENT.paletteChanged,()=>{
@@ -273,10 +501,18 @@ let Canvas = function(parent){
         ctx.clearRect(0,0,canvas.width,canvas.height);
     }
 
+    // The composite as drawn ON SCREEN: "vector"-display-mode layers are left out of the raster
+    // (they are painted as true SVG shapes by drawVectorShapes instead). Export/bake use the plain
+    // ImageFile.getCanvas(), which includes them rasterized.
+    function displayComposite(){
+        return ImageFile.getCanvas(undefined, {skipVectorDisplay: true});
+    }
+
     me.set = function(image,reset){
         if (reset){
             canvas.width = overlayCanvas.width = image.width;
             canvas.height = overlayCanvas.height = image.height;
+            syncVectorOverlaySize();
             zoom = 1;
             me.zoom(1);
         }
@@ -285,11 +521,12 @@ let Canvas = function(parent){
     
     me.update = function(){
         me.clear();
-        ctx.drawImage(ImageFile.getCanvas(),0,0);
+        ctx.drawImage(displayComposite(),0,0);
 
         let palette = Palette.get();
 
         me.applyGlobalFilter();
+        drawVectorShapes();
     }
 
     me.zoom = function(amount, event) {
@@ -336,6 +573,14 @@ let Canvas = function(parent){
         rulerOverlay.update();
 
         me.applyGlobalFilter();
+
+        // zoom changed the scale: re-rasterize the crisp "vector"-mode layers at the new zoom.
+        drawVectorShapes();
+
+        // zoom hid the overlay; redraw the warp grid at the new scale
+        if (getMeshWarpIfLoaded()?.isActive()) drawMeshOverlay();
+        if (getBoneToolIfLoaded()?.isActive()) drawBoneOverlay();
+        if (getVectorToolIfLoaded()?.isActive()) drawVectorOverlay();
     }
 
     me.getZoom = function(){
@@ -361,6 +606,10 @@ let Canvas = function(parent){
         containerTransform.x = tx;
         containerTransform.y = ty;
         setContainer();
+        // sizeBox lives outside the transformed container (it's appended to the
+        // viewport, not `container`), so panning doesn't move it via CSS like the
+        // selectbox — force it to recompute its position from the panned canvas rect.
+        if (resizer.isActive()) resizer.zoom(zoom);
     }
 
     me.getPanning = ()=>{
@@ -393,7 +642,9 @@ let Canvas = function(parent){
         let color = touchData.button?Palette.getBackgroundColor():Palette.getDrawColor();
         //if (window.override) color = "white";
         if (Editor.getCurrentTool() === COMMAND.ERASE) color = "transparent";
-        let {x,y} = touchData;
+        // layer-local: the active layer's pixels may sit at an offset from the document
+        let x = touchData.layerX;
+        let y = touchData.layerY;
 
         //TODO: should we cancel the draw if the coordinates are the same as the previous draw?
         if (touchData.previousDrawPoint && (x === touchData.previousDrawPoint.x && y === touchData.previousDrawPoint.y)){
@@ -402,7 +653,8 @@ let Canvas = function(parent){
 
 
         touchData.drawLayer = ImageFile.getActiveLayer();
-        touchData.drawLayer.draw(x,y,color,touchData);
+        let b = touchData.drawLayer.draw(x,y,color,touchData);
+        if (useIncrementalDisplay) accumulateDamage(b);
 
         if (touchData.previousDrawPoint){
             // fill in gaps
@@ -415,7 +667,8 @@ let Canvas = function(parent){
                 for (let i = 0; i < steps; i++){
                     let _x = p1.x + Math.round(delta.x*i);
                     let _y = p1.y + Math.round(delta.y*i);
-                    touchData.drawLayer.draw(_x,_y,color,touchData);
+                    let bb = touchData.drawLayer.draw(_x,_y,color,touchData);
+                    if (useIncrementalDisplay) accumulateDamage(bb);
                     // TODO: avoid duplicate _x,_y draws
                     // check how this affect transparency, especially in locked palette mode
                 }
@@ -512,8 +765,8 @@ let Canvas = function(parent){
                     Cursor.override("colorpicker");
                     Cursor.attach("colorpicker");
                     var pixel = ctx.getImageData(point.x, point.y, 1, 1).data;
-                    if (PaletteDialog.getPaletteClickAction() === "pick"){
-                        PaletteDialog.updateColor(pixel);
+                    if (getPaletteClickAction() === "pick"){
+                        pickColor(pixel);
                     }else{
                         Palette.setColor(pixel,!!e.button,true);
                     }
@@ -521,7 +774,47 @@ let Canvas = function(parent){
                     return;
                 }
 
+                // Mesh Warp owns all pointer interaction while active (pan/colour-pick above
+                // still work). Grab the nearest control point, if any, and consume the event.
+                let meshWarpTool = getMeshWarpIfLoaded();
+                if (meshWarpTool?.isActive()){
+                    touchData.meshWarping = true;
+                    meshWarpTool.handleDown(point, 8/zoom);
+                    return;
+                }
+
+                // Bone tool likewise owns all pointer interaction while a bone layer is active.
+                let boneTool = getBoneToolIfLoaded();
+                if (boneTool?.isActive()){
+                    touchData.boneEditing = true;
+                    boneTool.handleDown(point, 8/zoom);
+                    return;
+                }
+
+                // Vector tool likewise owns all pointer interaction while a vector layer is active.
+                let vectorTool = getVectorToolIfLoaded();
+                if (vectorTool?.isActive()){
+                    touchData.vectorEditing = true;
+                    vectorDownPoint = getCursorPosition(canvas,e,false,true);
+                    vectorTool.handleDown(vectorDownPoint, 8/zoom, {shift: Input.isShiftDown(), alt: Input.isAltDown(), ctrl: Input.isControlDown(), right: e.button === 2});
+                    return;
+                }
+
                 let currentTool = Editor.getCurrentTool();
+
+                // Lock guard: tools that modify the active layer's pixels no-op when the
+                // active layer (or any ancestor group) is locked, or when the active node
+                // is a group (no paintable canvas). Non-destructive tools (selection,
+                // colour pick, pan — handled above) remain usable on a locked layer.
+                const PIXEL_TOOLS = [
+                    COMMAND.DRAW, COMMAND.ERASE, COMMAND.SMUDGE, COMMAND.SPRAY, COMMAND.TEXT,
+                    COMMAND.FLOOD, COMMAND.CIRCLE, COMMAND.SQUARE, COMMAND.LINE,
+                    COMMAND.GRADIENT, COMMAND.ARC
+                ];
+                if (PIXEL_TOOLS.indexOf(currentTool) >= 0 && ImageFile.isActiveLayerLocked()){
+                    return;
+                }
+
                 switch (currentTool){
                     case COMMAND.DRAW:
                     case COMMAND.ERASE:
@@ -549,10 +842,11 @@ let Canvas = function(parent){
                         break;
                     case COMMAND.SELECTLAYER:
                         if (!isOnCanvas) return;
-                        let selectedLayerIndex = ImageFile.getTopLayerIndexAtPoint(point);
-                        if (selectedLayerIndex < 0) return;
-                        if (selectedLayerIndex !== ImageFile.getActiveLayerIndex()){
-                            ImageFile.activateLayer(selectedLayerIndex);
+                        let selectedLayerPath = ImageFile.getTopLayerIndexAtPoint(point);
+                        if (!selectedLayerPath) return;
+                        let activePath = ImageFile.getActiveLayerPath();
+                        if (selectedLayerPath.join(",") !== (activePath||[]).join(",")){
+                            ImageFile.activateLayer(selectedLayerPath);
                         }
                         EventBus.trigger(COMMAND.TRANSFORMLAYER);
                         break;
@@ -567,15 +861,18 @@ let Canvas = function(parent){
                     case COMMAND.FLOODSELECT:
                         if (Input.isShiftDown()) selectBox.startCombine("add");
                         else if (Input.isAltDown()) selectBox.startCombine("subtract");
-                        let c = selectBox.floodSelect(ImageFile.getActiveLayer().getCanvas(),point);
+                        let c = selectBox.floodSelect(ImageFile.getActiveLayerDocCanvas(),point);
                         selectBox.activate(COMMAND.FLOODSELECT);
                         selectBox.applyCanvas(c);
                         selectBox.finalizeCombine();
                         break;
                     case COMMAND.FLOOD:
                         HistoryService.start(EVENT.layerContentHistory);
-                        let cf = selectBox.floodSelect(ImageFile.getActiveLayer().getCanvas(),point,Color.fromString(e.button?Palette.getBackgroundColor():Palette.getDrawColor()));
-                        ImageFile.getActiveLayer().drawImage(cf)
+                        let cf = selectBox.floodSelect(ImageFile.getActiveLayerDocCanvas(),point,Color.fromString(e.button?Palette.getBackgroundColor():Palette.getDrawColor()));
+                        // the fill was computed in document space: draw it back into the
+                        // layer's own space by subtracting the layer's resolved offset
+                        let floodOffset = ImageFile.getLayerOffset();
+                        ImageFile.getActiveLayer().drawImage(cf,-floodOffset.x,-floodOffset.y)
                         HistoryService.end();
                         EventBus.trigger(EVENT.layerContentChanged);
                         break;
@@ -689,9 +986,10 @@ let Canvas = function(parent){
                             let box = resizer.get();
                             let w = box.width;
                             let h = box.height;
-                            let x = box.left;
-                            let y = box.top;
-                            ImageFile.getActiveLayer().drawShape(drawFunction,x,y,w,h);
+                            // the resizer works in document coordinates; the shape is drawn
+                            // into the layer's own canvas
+                            let origin = ImageFile.docToLayer({x:box.left,y:box.top});
+                            ImageFile.getActiveLayer().drawShape(drawFunction,origin.x,origin.y,w,h);
                             EventBus.trigger(EVENT.layerContentChanged);
                         });
                         break;
@@ -858,6 +1156,24 @@ let Canvas = function(parent){
                 }
                 break;
             case "up":
+                if (touchData.meshWarping){
+                    getMeshWarpIfLoaded()?.handleUp();
+                    touchData.meshWarping = false;
+                    touchData.isdown = false;
+                    return;
+                }
+                if (touchData.boneEditing){
+                    getBoneToolIfLoaded()?.handleUp();
+                    touchData.boneEditing = false;
+                    touchData.isdown = false;
+                    return;
+                }
+                if (touchData.vectorEditing){
+                    getVectorToolIfLoaded()?.handleUp();
+                    touchData.vectorEditing = false;
+                    touchData.isdown = false;
+                    return;
+                }
                 if (Editor.getCurrentTool() === COMMAND.ARC && touchData.arcState === 1){
                      let point = getCursorPosition(canvas,e,true);
                      let p1 = touchData.points[0];
@@ -948,6 +1264,38 @@ let Canvas = function(parent){
                     point = getCursorPosition(canvas,e,false);
                     currentCursorPoint = point;
 
+                    let meshWarpTool = getMeshWarpIfLoaded();
+                    if (meshWarpTool?.isActive()){
+                        meshWarpTool.handleHover(point, 8/zoom);
+                        StatusBar.setToolTip("Mesh Warp – drag points to warp, Enter to apply, Esc to cancel");
+                        return;
+                    }
+
+                    let boneTool = getBoneToolIfLoaded();
+                    if (boneTool?.isActive()){
+                        let boneHover = boneTool.handleHover(point, 8/zoom);
+                        // the shoulder-line radius handle gets a drag cursor; everything else the default
+                        if (boneHover === "radiusline") Cursor.set("boneradius"); else Cursor.reset();
+                        StatusBar.setToolTip("Bones – " + boneTool.getMode() + " mode");
+                        return;
+                    }
+
+                    let vectorTool = getVectorToolIfLoaded();
+                    if (vectorTool?.isActive()){
+                        vectorTool.handleHover(getCursorPosition(canvas,e,false,true), 8/zoom);
+                        // hover only enlarges the point/handle under the cursor — repaint just the
+                        // overlay, not the whole composite, so it stays cheap on every mouse move.
+                        if (vectorTool.hoverChanged) drawVectorOverlay();
+                        // action cursor: a base pointer with a glyph hinting what the hovered target does
+                        // (move a point/shape, bend a line, or — with Ctrl — insert a point). Only touch
+                        // the body classList when it actually changes — this runs on every mouse move.
+                        let vc = vectorTool.getHoverCursor(Input.isControlDown());
+                        if (vc){ if (!Cursor.isCurrent(vc)) Cursor.set(vc); }
+                        else if (!Cursor.isCurrent(undefined)) Cursor.reset();
+                        StatusBar.setToolTip("Vector – " + vectorTool.getMode() + " mode");
+                        return;
+                    }
+
                     if (touchData.hotDrawFunction){
                         touchData.hotDrawFunction(point.x,point.y);
                     }
@@ -984,6 +1332,21 @@ let Canvas = function(parent){
                         return;
                     }
 
+                    if (touchData.meshWarping){
+                        getMeshWarpIfLoaded()?.handleMove(point);
+                        return;
+                    }
+
+                    if (touchData.boneEditing){
+                        getBoneToolIfLoaded()?.handleMove(point);
+                        return;
+                    }
+
+                    if (touchData.vectorEditing){
+                        getVectorToolIfLoaded()?.handleMove(getCursorPosition(canvas,e,false,true), {shift: Input.isShiftDown()});
+                        return;
+                    }
+
                     if (touchData.isPolySelect){
                         selectBox.updatePoint(point);
                         return;
@@ -991,8 +1354,8 @@ let Canvas = function(parent){
 
                     if ((Input.isShiftDown() || Input.isAltDown()) && Editor.canPickColor(true) || Editor.getCurrentTool() === COMMAND.COLORPICKER){
                         var pixel = ctx.getImageData(point.x, point.y, 1, 1).data;
-                        if (PaletteDialog.getPaletteClickAction() === "pick"){
-                             PaletteDialog.updateColor(pixel);
+                        if (getPaletteClickAction() === "pick"){
+                             pickColor(pixel);
                         }else{
                             Palette.setColor(pixel,false,true);
                         }
@@ -1054,7 +1417,10 @@ let Canvas = function(parent){
     }
 
 
-    function getCursorPosition(elm, event, persist) {
+    // fractional=true returns sub-pixel document coordinates (vector editing needs them so nodes
+    // don't snap to the pixel grid). Everything else floors to whole pixels as before, and
+    // touchData is always kept in integer document space regardless.
+    function getCursorPosition(elm, event, persist, fractional) {
         const rect = elm.getBoundingClientRect();
 
         const centerX = rect.left + rect.width / 2;
@@ -1070,14 +1436,25 @@ let Canvas = function(parent){
         const canvasRotatedX = rotatedX / zoom;
         const canvasRotatedY = rotatedY / zoom;
 
-        const finalX = Math.floor(canvasRotatedX + canvas.width / 2);
-        const finalY = Math.floor(canvasRotatedY + canvas.height / 2);
+        const rawX = canvasRotatedX + canvas.width / 2;
+        const rawY = canvasRotatedY + canvas.height / 2;
+        const finalX = fractional ? rawX : Math.floor(rawX);
+        const finalY = fractional ? rawY : Math.floor(rawY);
 
         if (persist){
             touchData.prevX = touchData.x;
             touchData.prevY = touchData.y;
             touchData.x = finalX;
             touchData.y = finalY;
+            // Tools draw into the ACTIVE LAYER's canvas, which may be offset (and tweened)
+            // relative to the document. Carry both spaces: x/y stay document coordinates
+            // (overlay, status bar, selection rectangles), layerX/layerY are what any code
+            // that touches layer pixels must use (spec 004 design 3.6).
+            let local = ImageFile.docToLayer({x:finalX,y:finalY});
+            touchData.prevLayerX = touchData.layerX;
+            touchData.prevLayerY = touchData.layerY;
+            touchData.layerX = local.x;
+            touchData.layerY = local.y;
         }
         return{x:finalX,y:finalY};
     }
@@ -1092,6 +1469,111 @@ let Canvas = function(parent){
 
     function drawOverlay(point){
         EventBus.trigger(EVENT.drawCanvasOverlay,point);
+    }
+
+    function drawMeshOverlay(){
+        let meshWarpTool = getMeshWarpIfLoaded();
+        if (meshWarpTool?.isActive()){
+            overlayCanvas.style.opacity = 1;
+            meshWarpTool.drawOverlay(overlayCtx, zoom);
+        }else{
+            overlayCtx.clearRect(0,0,overlayCanvas.width,overlayCanvas.height);
+            overlayCanvas.style.opacity = 0;
+        }
+    }
+
+    function drawBoneOverlay(){
+        let boneTool = getBoneToolIfLoaded();
+        if (boneTool?.isActive()){
+            overlayCanvas.style.opacity = 1;
+            boneTool.drawOverlay(overlayCtx, zoom);
+        }else{
+            overlayCtx.clearRect(0,0,overlayCanvas.width,overlayCanvas.height);
+            overlayCanvas.style.opacity = 0;
+        }
+    }
+
+    function syncVectorOverlaySize(){
+        let box = "0 0 " + canvas.width + " " + canvas.height;
+        if (vectorOverlay) vectorOverlay.setAttribute("viewBox", box);
+        if (vectorShapes) vectorShapes.setAttribute("viewBox", box);
+    }
+
+    function drawVectorOverlay(){
+        let vectorTool = getVectorToolIfLoaded();
+        if (vectorTool?.isActive()){
+            vectorOverlay.style.display = "block";
+            vectorTool.drawOverlay(vectorOverlay, zoom);
+        }else{
+            while (vectorOverlay.firstChild) vectorOverlay.removeChild(vectorOverlay.firstChild);
+            vectorOverlay.style.display = "none";
+        }
+    }
+
+    // Paints "vector"-display-mode layers as TRUE vector shapes (spec 008). On screen the base
+    // composite leaves these layers out (getCanvas skipVectorDisplay); here we render their geometry
+    // as real SVG <path>s inside the zoomed container, so — like the editing overlay — they scale
+    // crisply with zoom for free (the document is the viewBox; strokes scale in document units). No
+    // rasterization on screen at all: a true vector layer, only baked to pixels on export/save.
+    //
+    // Limitation: the SVG sits above the whole raster composite, so a vector layer stacked BELOW
+    // other layers previews above them. Export/save keep the true stacking order at document
+    // resolution; the common case (vector line-art on top) matches exactly.
+    function drawVectorShapes(){
+        while (vectorShapes.firstChild) vectorShapes.removeChild(vectorShapes.firstChild);
+        let layers = ImageFile.getVectorDisplayLayers ? ImageFile.getVectorDisplayLayers() : [];
+        if (!layers || !layers.length){
+            vectorShapes.style.display = "none";
+            return;
+        }
+        layers.forEach(layer=>{
+            let ops = getVectorSvgShapes(layer.vector);
+            if (!ops.length) return;
+            // One group per layer carries its accumulated document offset, opacity and blend mode.
+            let g = document.createElementNS(SVGNS,"g");
+            if (layer.x || layer.y) g.setAttribute("transform","translate(" + layer.x + " " + layer.y + ")");
+            if (typeof layer.opacity === "number" && layer.opacity < 1) g.setAttribute("opacity", layer.opacity);
+            if (layer.blend && layer.blend !== "normal") g.style.mixBlendMode = layer.blend;
+            ops.forEach(op=>{
+                if (op.kind === "text"){
+                    let text = document.createElementNS(SVGNS, "text");
+                    text.setAttribute("x", op.x);
+                    text.setAttribute("y", op.y);
+                    text.setAttribute("font-family", op.font || "Arial");
+                    text.setAttribute("font-size", op.fontSize);
+                    text.setAttribute("text-anchor", op.align === "center" ? "middle" : (op.align === "right" ? "end" : "start"));
+                    text.setAttribute("fill", op.fill || "none");
+                    if (op.stroke){
+                        text.setAttribute("stroke", op.stroke);
+                        text.setAttribute("stroke-width", op.width || 0);
+                    }
+                    text.textContent = op.text || "";
+                    g.appendChild(text);
+                }else{
+                    let path = document.createElementNS(SVGNS,"path");
+                    path.setAttribute("d", op.d);
+                    if (op.fill){
+                        path.setAttribute("fill", op.fill);
+                        if (op.fillRule && op.fillRule !== "nonzero") path.setAttribute("fill-rule", op.fillRule);
+                        if (op.stroke){
+                            path.setAttribute("stroke", op.stroke);
+                            path.setAttribute("stroke-width", op.width);
+                            path.setAttribute("stroke-linecap", "round");
+                            path.setAttribute("stroke-linejoin", "round");
+                        }
+                    }else{
+                        path.setAttribute("fill", "none");
+                        path.setAttribute("stroke", op.stroke);
+                        path.setAttribute("stroke-width", op.width);
+                        path.setAttribute("stroke-linecap", "round");
+                        path.setAttribute("stroke-linejoin", "round");
+                    }
+                    g.appendChild(path);
+                }
+            });
+            vectorShapes.appendChild(g);
+        });
+        vectorShapes.style.display = "block";
     }
 
     function setContainer(){
@@ -1125,6 +1607,13 @@ let Canvas = function(parent){
 
     me.applyGlobalFilter = function(){
         if (Palette.isLockedGlobal()){
+            if (effectDitherPreview){
+                let dither = Palette.getDitherSettings();
+                if (dither.index > 0){
+                    ImageProcessing.remap(canvas, Palette.get(), dither.index, dither.amount, dither.grain, dither.variance);
+                    return;
+                }
+            }
             runWebGLQuantizer(canvas, Palette.get(), false, undefined, 1, 0);
         }
     }
@@ -1132,39 +1621,20 @@ let Canvas = function(parent){
     //Bresenham's_line_algorithm
     //http://rosettacode.org/wiki/Bitmap/Bresenham's_line_algorithm
     function bLine_(x0, y0, x1, y1,ctx,color,lineWidth) {
+        // Spec 016 phase 3 (R4): the Bresenham stamp now runs in the pure clipped
+        // kernel (util/lineKernel.js). In-bounds pixels are written byte-identically;
+        // pixels beyond the image edge are clipped instead of wrapping into the
+        // wrong row as the old inline drawPixel did.
         let imgData=ctx.getImageData(0,0,canvas.width,canvas.height);
-        let data = imgData.data;
-        lineWidth = lineWidth || 1;
-        if (lineWidth<1) lineWidth=1;
-
-        var dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-        var dy = Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-        var err = (dx>dy ? dx : -dy)/2;
-
-        let lineStart = 0-Math.floor(lineWidth/2);
-        let lineEnd = parseInt(lineWidth)+lineStart;
-
-        while (true) {
-            for(let i=lineStart;i<lineEnd;i++){
-                for (let j=lineStart;j<lineEnd;j++){
-                    drawPixel(x0+i,y0+j);
-                }
-            }
-
-            if (x0 === x1 && y0 === y1) break;
-            var e2 = err;
-            if (e2 > -dx) { err -= dy; x0 += sx; }
-            if (e2 < dy) { err += dx; y0 += sy; }
-        }
+        stampLine({
+            data: imgData.data,
+            width: canvas.width,
+            height: canvas.height,
+            x0: x0, y0: y0, x1: x1, y1: y1,
+            color: color,
+            lineWidth: lineWidth
+        });
         ctx.putImageData(imgData,0,0);
-
-        function drawPixel(x,y){
-            let n=(y*canvas.width+x)*4;
-            data[n]=color[0];
-            data[n+1]=color[1];
-            data[n+2]=color[2];
-            data[n+3]=255;
-        }
     }
 
 

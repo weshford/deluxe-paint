@@ -1,22 +1,20 @@
 import BinaryStream from "../util/binarystream.js";
-import AmigaIcon from "./amigaIcon.js";
-import IFF from "./iff.js";
-import GIF from "./gif.js";
-import PNG from "./png.js";
-import PSD from "./psd.js";
-import Aseprite from "./aseprite.js";
-import DEGAS from "./degas.js";
 
+// File-type sniffing on open. Each branch only loads the ONE format module it actually needs
+// (dynamic import), instead of this module (reached eagerly from image.js on every session)
+// statically pulling in every format parser — IFF/PSD/GIF/PNG/Aseprite/DEGAS/PCX/AmigaIcon — just
+// to open a single file.
 let FileDetector = (function () {
     let me = {};
 
     me.detect = function (data, name) {
-        return new Promise((next) => {
+        return new Promise(async (next) => {
             name = name || "";
             let ext = name.split(".").pop().toLowerCase();
             let file;
 
             if (ext === "info") {
+                let AmigaIcon = (await import("./amigaIcon.js")).default;
                 file = BinaryStream(data.slice(0, data.byteLength), true);
                 file.goto(0);
                 // Note: this can be Async!
@@ -37,6 +35,7 @@ let FileDetector = (function () {
                     }
                 });
             } else if (ext === "gif"){
+                let GIF = (await import("./gif.js")).default;
                 // Note: GIFs are always little-endian
                 // see https://www.w3.org/Graphics/GIF/spec-gif89a.txt
                 file = BinaryStream(data.slice(0, data.byteLength), false);
@@ -48,6 +47,7 @@ let FileDetector = (function () {
                     next(false);
                 }
             } else if (ext === "png"){
+                let PNG = (await import("./png.js")).default;
                 // check if it's an indexed PNG
                 // note: PNGs are always big-endian
                 file = BinaryStream(data.slice(0, data.byteLength), true);
@@ -59,6 +59,7 @@ let FileDetector = (function () {
                     next(false);
                 }
             } else if (ext === "psd"){
+                let PSD = (await import("./psd.js")).default;
                 file = BinaryStream(data.slice(0, data.byteLength), true);
                 file.goto(0);
                 let result = PSD.detect(file);
@@ -76,7 +77,27 @@ let FileDetector = (function () {
                 }else{
                     next(false);
                 }
+            } else if (ext === "pdf"){
+                let PDF = (await import("./pdf.js")).default;
+                file = BinaryStream(data.slice(0, data.byteLength), true);
+                file.goto(0);
+                let result = PDF.detect(file);
+                if (result){
+                    let data = await PDF.parse(file);
+                    if (data && data.image){
+                        next({
+                            image: data.image,
+                            type: "PDF",
+                            data: data,
+                        });
+                    }else{
+                        next(false);
+                    }
+                }else{
+                    next(false);
+                }
             } else if (ext === "pi1" || ext === "pi2" || ext === "pi3") {
+                let DEGAS = (await import("./degas.js")).default;
                 file = BinaryStream(data.slice(0, data.byteLength), true);
                 file.goto(0);
                 if (DEGAS.detect(file)) {
@@ -94,6 +115,7 @@ let FileDetector = (function () {
                     next(false);
                 }
             } else if (ext === "neo") {
+                let DEGAS = (await import("./degas.js")).default;
                 file = BinaryStream(data.slice(0, data.byteLength), true);
                 file.goto(0);
                 if (DEGAS.detectNeo(file)) {
@@ -111,6 +133,7 @@ let FileDetector = (function () {
                     next(false);
                 }
             } else if (ext === "ase" || ext === "aseprite"){
+                let Aseprite = (await import("./aseprite.js")).default;
                 file = BinaryStream(data.slice(0, data.byteLength), false);
                 file.goto(0);
                 let result = Aseprite.detect(file);
@@ -128,13 +151,32 @@ let FileDetector = (function () {
                 }else{
                     next(false);
                 }
+            } else if (ext === "pcx") {
+                let PCX = (await import("./pcx.js")).default;
+                file = BinaryStream(data.slice(0, data.byteLength), false);
+                file.goto(0);
+                if (PCX.detect(file)) {
+                    let parsed = PCX.parse(file);
+                    if (parsed && parsed.image) {
+                        next({
+                            image: parsed.image,
+                            type: "PCX",
+                            data: parsed,
+                        });
+                    } else {
+                        next(false);
+                    }
+                } else {
+                    next(false);
+                }
             } else {
                 file = BinaryStream(data.slice(0, data.byteLength), true);
                 file.goto(0);
-                detectIFF();
+                await detectIFF();
             }
 
-            function detectIFF() {
+            async function detectIFF() {
+                let IFF = (await import("./iff.js")).default;
                 let fileType = IFF.detect(file);
                 if (fileType) {
                     let data = IFF.parse(file, true, fileType);

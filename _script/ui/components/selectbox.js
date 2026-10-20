@@ -9,6 +9,9 @@ import {duplicateCanvas, releaseCanvas, outLineCanvas} from "../../util/canvasUt
 import Color from "../../util/color.js";
 import ToolOptions from "./toolOptions.js";
 import Palette from "../palette.js";
+import {computeFloodRegion} from "../../util/fillKernel.js";
+import HistoryService from "../../services/historyservice.js";
+import {isVector} from "../../util/layerUtils.js";
 
 /*
     SelectBox follows changes in the selection.
@@ -262,6 +265,13 @@ let SelectBox = ((editor,resizer)=>{
 
 
     me.floodSelect = function(canvas,point,fillColor){
+        // Spec 016 phase 3 (R4): the connectivity walk now runs in the pure span
+        // kernel (util/fillKernel.js) instead of an inline hash-set + shift() queue.
+        // The matching predicate is byte-identical (exact 4-channel match, else
+        // Euclidean RGBA distance <= tolerance*2), so the painted result is
+        // unchanged; only the traversal is faster and bounded.
+        let isFloodFill = !!fillColor;
+        let useGlobalFloodSelect = !isFloodFill && ToolOptions.useFloodSelectGlobal();
         fillColor = fillColor||[0,0,0];
         let w = canvas.width;
         let h = canvas.height;
@@ -272,68 +282,35 @@ let SelectBox = ((editor,resizer)=>{
         let c = duplicateCanvas(canvas).getContext("2d");
         let target = c.getImageData(0,0,w,h);
 
-        let done = {};
-        let check = [];
-        let ind = getIndex(point);
-        put(ind);
-        let color = getColor(ind);
+        let startIndex = point.y*w + point.x;
+        let region = computeFloodRegion({
+            data: imageData.data,
+            width: w,
+            height: h,
+            startIndex: startIndex,
+            tolerance: tolerance,
+            connectivity: 4,
+            global: useGlobalFloodSelect
+        });
 
-        while (check.length){
-            let i = check.shift();
-            let x = i%w;
-            let y = (i-x)/w;
-            if (x>0) checkIndex(i-1);
-            if (x<w-1) checkIndex(i+1);
-            if (y>0) checkIndex(i-w);
-            if (y<h-1) checkIndex(i+w);
+        let matched = region.matched;
+        for (let i=0;i<matched.length;i++){
+            if (matched[i]){
+                target.data[i*4] = fillColor[0];
+                target.data[i*4 + 1] = fillColor[1];
+                target.data[i*4 + 2] = fillColor[2];
+                target.data[i*4 + 3] = 255;
+            }
         }
 
         c.putImageData(target,0,0);
         return c.canvas;
-
-        function getColor(index){
-            index *= 4;
-            let r = imageData.data[index];
-            let g = imageData.data[index+1];
-            let b = imageData.data[index+2];
-            let a = imageData.data[index+3];
-            if (index>=imageData.data.length){
-                console.error("invalid index " + index)
-            }else{
-                return Color.toHex([r,g,b,a]);
-            }
-
-        }
-
-        function getIndex(p) {
-            return p.y*w + p.x;
-        }
-
-        function checkIndex(ind){
-            if (!done[ind]){
-                let c = getColor(ind);
-                let passed = c === color;
-                if (!passed && tolerance){
-                    let distance = Color.distance(c,color);
-                    passed = distance <= tolerance*2;
-                }
-                if (passed) put(ind);
-            }
-        }
-
-        function put(ind){
-            target.data[ind*4] = fillColor[0];
-            target.data[ind*4 + 1] = fillColor[1];
-            target.data[ind*4 + 2] = fillColor[2];
-            target.data[ind*4 + 3] = 255;
-            done[ind] = true;
-            check.push(ind)
-        }
     }
 
 
     me.colorSelect = function(color){
-        let canvas = ImageFile.getActiveLayer().getCanvas();
+        // selections live in DOCUMENT space, so read the layer projected into it
+        let canvas = ImageFile.getActiveLayerDocCanvas();
 
         let w = canvas.width;
         let h = canvas.height;
@@ -363,7 +340,7 @@ let SelectBox = ((editor,resizer)=>{
     }
 
     me.colorSelectNotInPalette = function(){
-        let canvas = ImageFile.getActiveLayer().getCanvas();
+        let canvas = ImageFile.getActiveLayerDocCanvas();
         let palette = Palette.get();
 
         let w = canvas.width;
@@ -404,7 +381,7 @@ let SelectBox = ((editor,resizer)=>{
     }
 
     me.alphaSelect = function(){
-        let canvas = ImageFile.getActiveLayer().getCanvas();
+        let canvas = ImageFile.getActiveLayerDocCanvas();
 
         let w = canvas.width;
         let h = canvas.height;
@@ -645,7 +622,12 @@ let SelectBox = ((editor,resizer)=>{
         }
     }
 
+    EventBus.on(EVENT.sizerEndChange,()=>{
+        endPixelFloat();
+    });
+
     function cleanUp(){
+        endPixelFloat();
         selectionPoints = [];
         selectionTransform = undefined;
         if (dots){
@@ -670,6 +652,103 @@ let SelectBox = ((editor,resizer)=>{
             selecting = false;
             me.endPolySelect();
         }
+    }
+
+    // Ctrl-drag on the selection body or on a resize handle (move/scale selected pixels, not just
+    // the marquee): conceptually "cut, transform, merge back" in one drag. The layer pixels under
+    // the selection are lifted into a floating buffer ONCE (at the drag's start position/size) and
+    // the source pixels are cleared to transparent there ONCE too — that "background" snapshot
+    // never changes afterwards. Every subsequent frame just redraws background + floating,
+    // remapped to the live drag rect, so the hole only ever exists at the original position/size,
+    // never at any position/size passed through mid-drag. Both are baked back into the layer as
+    // one history step when the drag commits (on drag end, or earlier if Ctrl is released first).
+    let pixelFloat;
+
+    function startPixelFloat(selection){
+        let layer = ImageFile.getActiveLayer();
+        if (!layer || layer.locked || layer.type === "group" || isVector(layer)) return;
+        if (!selection.width || !selection.height) return;
+        let layerCtx = layer.getContext();
+        // Everything below (the mask placement and the remap in updatePixelFloat) works in the
+        // layer's own CANVAS space, so the canvas origin counts on top of the layer offset —
+        // see ImageFile.getLayerCanvasOffset.
+        let offset = ImageFile.getLayerCanvasOffset();
+        let w = ImageFile.getCurrentFile().width;
+        let h = ImageFile.getCurrentFile().height;
+
+        let mask = selectionToCanvas(selection, w, h);
+        let original = duplicateCanvas(layerCtx.canvas, true);
+
+        let floating = document.createElement("canvas");
+        floating.width = layerCtx.canvas.width;
+        floating.height = layerCtx.canvas.height;
+        let fctx = floating.getContext("2d");
+        fctx.drawImage(original,0,0);
+        fctx.globalCompositeOperation = "destination-in";
+        fctx.drawImage(mask,-offset.x,-offset.y);
+        fctx.globalCompositeOperation = "source-over";
+
+        let background = document.createElement("canvas");
+        background.width = layerCtx.canvas.width;
+        background.height = layerCtx.canvas.height;
+        let bctx = background.getContext("2d");
+        bctx.drawImage(original,0,0);
+        bctx.globalCompositeOperation = "destination-out";
+        bctx.drawImage(mask,-offset.x,-offset.y);
+        bctx.globalCompositeOperation = "source-over";
+
+        releaseCanvas(original);
+        releaseCanvas(mask);
+
+        HistoryService.start(EVENT.layerContentHistory);
+
+        pixelFloat = {
+            layerCtx: layerCtx,
+            background: background,
+            floating: floating,
+            offset: offset,
+            origLeft: selection.left,
+            origTop: selection.top,
+            origWidth: selection.width,
+            origHeight: selection.height
+        };
+    }
+
+    // newLeft/Top/Width/Height are the LIVE drag rect (document space, same shape as Selection).
+    // Moving is just the degenerate case of this same mapping (scale 1, pure translate).
+    function updatePixelFloat(newLeft,newTop,newWidth,newHeight){
+        if (!pixelFloat) return;
+        let scaleX = newWidth / pixelFloat.origWidth;
+        let scaleY = newHeight / pixelFloat.origHeight;
+        if (!isFinite(scaleX)) scaleX = 1;
+        if (!isFinite(scaleY)) scaleY = 1;
+
+        // Map layer-space point (origLeft-offset, origTop-offset) — the original selection's
+        // top-left, in the floating canvas's own coordinate space — to where the live rect's
+        // top-left now is, scaling everything else around that anchor.
+        let origLeftLayer = pixelFloat.origLeft - pixelFloat.offset.x;
+        let origTopLayer = pixelFloat.origTop - pixelFloat.offset.y;
+        let newLeftLayer = newLeft - pixelFloat.offset.x;
+        let newTopLayer = newTop - pixelFloat.offset.y;
+        let dx = newLeftLayer - origLeftLayer*scaleX;
+        let dy = newTopLayer - origTopLayer*scaleY;
+
+        let ctx = pixelFloat.layerCtx;
+        ctx.clearRect(0,0,ctx.canvas.width,ctx.canvas.height);
+        ctx.drawImage(pixelFloat.background,0,0);
+        ctx.imageSmoothingEnabled = ToolOptions.isSmooth();
+        ctx.drawImage(pixelFloat.floating,dx,dy,pixelFloat.floating.width*scaleX,pixelFloat.floating.height*scaleY);
+        ctx.imageSmoothingEnabled = false;
+        EventBus.trigger(EVENT.layerContentChanged);
+        EventBus.trigger(EVENT.imageContentChanged);
+    }
+
+    function endPixelFloat(){
+        if (!pixelFloat) return;
+        releaseCanvas(pixelFloat.background);
+        releaseCanvas(pixelFloat.floating);
+        pixelFloat = undefined;
+        HistoryService.end();
     }
 
     function selectionToCanvas(selection, w, h){
@@ -713,6 +792,9 @@ let SelectBox = ((editor,resizer)=>{
 
     EventBus.on(EVENT.sizerStartChange,()=>{
         if (me.isActive()  && editor.isActive()){
+            // Safety net: a new drag gesture is starting, so any pixel float left dangling by a
+            // previous one (should already be closed by sizerEndChange) must not bleed into it.
+            endPixelFloat();
             let selection = Selection.get();
             if (selection.canvas){
                 selectionTransform = {
@@ -749,6 +831,22 @@ let SelectBox = ((editor,resizer)=>{
                     translate.scaleY = currentSize.height/fromSize.height;
                     if (isNaN(translate.scaleX)) translate.scaleX = 1;
                     if (isNaN(translate.scaleY)) translate.scaleY = 1;
+
+                    // change.dotIndex (8 = whole-box move, 0-7 = a resize handle) is only set by an
+                    // actual pointer drag on the sizebox/a handle (resizer.js) — never by resizer
+                    // init, an arrow-key nudge, or the shift-aspect-lock replay on modifier change.
+                    // Inferring "is this a drag frame" from the from/to deltas instead is ambiguous:
+                    // a single-axis resize handle leaves the other axis unchanged all gesture long,
+                    // and any momentarily-stationary frame leaves both unchanged, so either can look
+                    // identical to a pure move. dotIndex sidesteps that entirely, and — since a move
+                    // is just a resize with scale 1 — the same updatePixelFloat handles both.
+                    let isDragFrame = typeof change.dotIndex === "number";
+                    if (isDragFrame && Input.isControlDown()){
+                        if (!pixelFloat) startPixelFloat(selection);
+                        if (pixelFloat) updatePixelFloat(currentSize.left, currentSize.top, currentSize.width, currentSize.height);
+                    } else if (pixelFloat && isDragFrame){
+                        endPixelFloat();
+                    }
 
                     if (selection.points && selection.points.length){
                         selectionPoints = selection.points;
@@ -829,6 +927,7 @@ let SelectBox = ((editor,resizer)=>{
 
     EventBus.on(EVENT.toolChanged,(tool)=>{
         if (me.isActive()){
+            endPixelFloat();
             selectionTransform = undefined;
             selectionMode = "replace";
             pendingBaseSelection = undefined;
